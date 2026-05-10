@@ -49,7 +49,14 @@ line-length = 88
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-p no:cacheprovider"
+addopts = "-p no:cacheprovider --cov=rotapool --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["rotapool"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
 
 [tool.pyright]
 venvPath = "."
