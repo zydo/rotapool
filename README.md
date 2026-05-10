@@ -59,7 +59,6 @@ pool = Pool(
     max_attempts=None,       # Override the pool's max_attempts for this decorated function
     deadline=None,           # Absolute time.monotonic() deadline; None = no deadline
     retry_delay=0.5,         # Seconds to pause between failed attempts
-    request_id=None,         # Opaque string attached to every Usage (e.g. HTTP request-id); auto-UUID if None
 )
 async def call_upstream(resource, url, payload):
     async with httpx.AsyncClient() as client:
@@ -86,7 +85,7 @@ result = await call_upstream("https://api.example.com/v1/chat", {"prompt": "hi"}
 
 ### Option 2: Direct `run()`
 
-`@pool.rotated()` is a thin shim over `pool.run()`. Use `run()` directly when you want per-call overrides or when the call site can't be decorated:
+`@pool.rotated()` is a thin shim over `pool.run()`, but it only accepts the policy knobs that are safe to fix at decoration time (`max_attempts`, `deadline`, `retry_delay`). Anything that needs to vary **per call** must go through `run()` directly — most notably `request_id`, which is meant to correlate with caller-side context (e.g. an inbound HTTP request id) and would be wrong to bake into the decorator. Use `run()` directly when you want per-call overrides or when the call site can't be decorated:
 
 ```python
 async def call_upstream(resource, url, payload):
@@ -220,7 +219,6 @@ await pool.run(
     max_attempts: int | None = None,     # Per-call override; None = use pool default
     deadline: float | None = None,       # Absolute time.monotonic() deadline
     retry_delay: float = 0.5,            # Pause between failed attempts
-    request_id: str | None = None,       # Opaque string for Usage tracking
 )
 # Returns a decorator. The decorated function receives a Resource[T] as its
 # first positional argument (injected by the wrapper), followed by caller args.

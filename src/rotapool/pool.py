@@ -195,7 +195,6 @@ class Pool(AgentReadableMixin, Generic[T]):
         max_attempts: int | None = None,
         deadline: float | None = None,
         retry_delay: float = 0.5,
-        request_id: str | None = None,
     ) -> Callable[[Callable[..., Awaitable[R]]], Callable[..., Awaitable[R]]]:
         """Decorator factory: wrap a callable so every call goes through ``self.run()``
         with resource rotation and retry.
@@ -218,7 +217,6 @@ class Pool(AgentReadableMixin, Generic[T]):
                     max_attempts=max_attempts,
                     deadline=deadline,
                     retry_delay=retry_delay,
-                    request_id=request_id,
                 )
 
             return wrapper
