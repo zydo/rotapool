@@ -1,7 +1,7 @@
 [project]
 name = "rotapool"
-version = "0.1.1"
-description = "Generic async resource pool with rotation, cooldown, and retry"
+version = "0.1.2"
+description = "Generic async resource pool with health-aware selection, cooldown, and retry"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -27,9 +27,7 @@ classifiers = [
     "Framework :: AsyncIO",
     "Typing :: Typed",
 ]
-dependencies = [
-    "agent-readable==0.1.0",
-]
+dependencies = ["agent-readable>=0.1.0"]
 
 [project.urls]
 Source = "https://github.com/zydo/rotapool"

@@ -2,6 +2,8 @@
 
 Async resource pool with inline health feedback, automatic cooldown, and retry — for API keys, proxies, GPU workers, or anything that can rate-limit you or go down.
 
+> **Designed for AI coding agents,** `rotapool` exposes machine-readable usage notes via [agent-readable](https://github.com/zydo/agent-readable). When generating code that uses `Pool`, tell your coding agent to run `pip install agent-readable` and then `python -m agent_readable rotapool.Pool` to learn about the operation contract, do/don't rules, anti-patterns, and failure modes.
+
 ## Core idea
 
 Most resource pools are passive — they hand out resources round-robin or at random, and rely on external health checks to detect and remove bad ones. `rotapool` closes that gap: every call through the pool is also a health probe. The pool learns from caller signals in real time and immediately adjusts which resources to offer — no external probers or manual updates needed.
@@ -384,6 +386,45 @@ def call_in_thread(resource, payload):
 ```
 
 A callable that returns a non-Awaitable (e.g. a plain `int`) raises `TypeError` at call time. The resource is marked healthy (your bug, not the resource's) and the error propagates to the caller.
+
+## Pitfalls
+
+### Anti-pattern: doing the real work outside `run()`
+
+The pool only sees what happens **inside** the operation. Returning a client or handle from `run()` and using it afterwards means every later failure is invisible — the attempt is already recorded as success and the cooldown counter was reset.
+
+```python
+# WRONG — the actual API call is outside the pool's view.
+client = await pool.run(lambda r: build_client(r.value))
+response = await client.get("/things")  # invisible to pool
+```
+
+```python
+# RIGHT — the call lives inside the operation, so 429s reach the pool.
+async def fetch(resource):
+    client = build_client(resource.value)
+    try:
+        return await client.get("/things")
+    except RateLimited as e:
+        raise CooldownResource(cooldown_seconds=e.retry_after)
+
+response = await pool.run(fetch)
+```
+
+Return only plain values (bytes, dict, dataclass) from operations. For N backend calls, make N `run()` invocations.
+
+### Don't
+
+- **Don't raise `CooldownResource` for business errors** (404, validation failures). The next resource will return the same error and burn the retry budget for nothing — these belong in normal exceptions or return values.
+- **Don't catch and swallow exceptions inside the operation.** The pool needs to see `CooldownResource` / `DisableResource` to update health; swallowing them turns rate limits into invisible successes.
+- **Don't mutate `Resource` fields from outside the pool.** `status`, `cooldown_until`, `last_acquired_at`, and `consecutive_cooldown` are framework-owned lifecycle state.
+- **Don't share one `Pool` across asyncio event loops.** The internal lock binds to the loop where it was first awaited; reusing the pool from a different loop is undefined behaviour.
+
+### Gotcha: cancellation only hits younger siblings
+
+When a resource raises `CooldownResource` or `DisableResource`, the framework cancels **younger** in-flight usages on that resource and retries them elsewhere. **Older** usages are left to run to completion — they may already have side effects upstream that you can't unwind.
+
+`asyncio.CancelledError` from this sibling cancellation is swallowed by the framework and the affected usages retry on a fresh resource; only **outer caller cancellation** propagates back to the caller.
 
 ## Testing
 

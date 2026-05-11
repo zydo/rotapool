@@ -506,6 +506,24 @@ result = asyncio.run(pool.run(call))
 async def fetch(resource, url): ...
 ```
 
+### Strategy: primary_backup
+
+Default strategy is ``"round_robin"`` (fairness across resources). Pass
+``strategy="primary_backup"`` to instead exhaust earlier resources before
+touching later ones -- list/dict order becomes the priority ranking.
+
+```python
+# Use the paid key first; only fall back to free when the paid key is
+# rate-limited (cooling_down), revoked (disabled), or at max_in_flight.
+pool = Pool(
+    resources=[
+        Resource(resource_id="paid",  value="sk-paid-...",  max_in_flight=8),
+        Resource(resource_id="free",  value="sk-free-..."),
+    ],
+    strategy="primary_backup",
+)
+```
+
 ### Anti-pattern: doing the real work OUTSIDE ``run()``
 
 The pool only sees what happens INSIDE the operation. Returning a client /
