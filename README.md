@@ -53,9 +53,9 @@ pool = Pool(
 ### Option 1: Use the decorator
 
 ```python
-# Resource rotation happens automatically.
+# Resource selection happens automatically per the pool's strategy (round_robin by default).
 # All parameters are optional and forward to pool.run() on every call.
-@pool.rotated(
+@pool.use(
     max_attempts=None,       # Override the pool's max_attempts for this decorated function
     deadline=None,           # Absolute time.monotonic() deadline; None = no deadline
     retry_delay=0.5,         # Seconds to pause between failed attempts
@@ -85,7 +85,7 @@ result = await call_upstream("https://api.example.com/v1/chat", {"prompt": "hi"}
 
 ### Option 2: Direct `run()`
 
-`@pool.rotated()` is a thin shim over `pool.run()`, but it only accepts the policy knobs that are safe to fix at decoration time (`max_attempts`, `deadline`, `retry_delay`). Anything that needs to vary **per call** must go through `run()` directly — most notably `request_id`, which is meant to correlate with caller-side context (e.g. an inbound HTTP request id) and would be wrong to bake into the decorator. Use `run()` directly when you want per-call overrides or when the call site can't be decorated:
+`@pool.use()` is a thin shim over `pool.run()`, but it only accepts the policy knobs that are safe to fix at decoration time (`max_attempts`, `deadline`, `retry_delay`). Anything that needs to vary **per call** must go through `run()` directly — most notably `request_id`, which is meant to correlate with caller-side context (e.g. an inbound HTTP request id) and would be wrong to bake into the decorator. Use `run()` directly when you want per-call overrides or when the call site can't be decorated:
 
 ```python
 async def call_upstream(resource, url, payload):
@@ -186,7 +186,7 @@ Cancellation is **best-effort**: it works when the operation returns a coroutine
 
 ### Retry
 
-`pool.run()` drives the retry loop. `@pool.rotated()` is a thin decorator shim over it. Attempts are capped at `min(max_attempts, len(resources))` — more retries than resources is pointless.
+`pool.run()` drives the retry loop. `@pool.use()` is a thin decorator shim over it. Attempts are capped at `min(max_attempts, len(resources))` — more retries than resources is pointless.
 
 ### Cancellation discrimination
 
@@ -247,7 +247,7 @@ await pool.run(
 ```
 
 ```python
-@pool.rotated(
+@pool.use(
     max_attempts: int | None = None,     # Per-call override; None = use pool default
     deadline: float | None = None,       # Absolute time.monotonic() deadline
     retry_delay: float = 0.5,            # Pause between failed attempts
@@ -353,13 +353,13 @@ Resource(resource_id="gpu-0", value="cuda:0", max_in_flight=1)
 
 ## Operation shapes
 
-`pool.run` and `@pool.rotated` accept any callable that returns an `Awaitable`. The framework picks the cancellation strategy at runtime based on what the callable returns:
+`pool.run` and `@pool.use` accept any callable that returns an `Awaitable`. The framework picks the cancellation strategy at runtime based on what the callable returns:
 
 ```python
 # 1. async def -- the typical case. Cancellation is full-strength: the
 #    framework wraps the coroutine in a Task and cancels younger siblings
 #    via task.cancel() on resource failure.
-@pool.rotated()
+@pool.use()
 async def call_async(resource, payload):
     async with httpx.AsyncClient() as client:
         return await client.post(url, json=payload,
@@ -367,13 +367,13 @@ async def call_async(resource, payload):
 
 # 2. Sync function returning a coroutine -- previously rejected, now accepted.
 #    Useful when you want to construct the coroutine yourself or thread args.
-@pool.rotated()
+@pool.use()
 def call_returning_coro(resource, payload):
     return some_async_helper(resource.value, payload)  # returns a coroutine
 
 # 3. Sync function returning an asyncio.Future -- accepted and cancellable
 #    via Future.cancel(). Useful for executor wrappers.
-@pool.rotated()
+@pool.use()
 def call_in_thread(resource, payload):
     loop = asyncio.get_running_loop()
     return loop.run_in_executor(None, blocking_request, resource.value, payload)

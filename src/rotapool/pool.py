@@ -228,15 +228,15 @@ class Pool(AgentReadableMixin, Generic[T]):
             f"max_attempts={effective_attempts} exhausted: {last_error!r}"
         )
 
-    def rotated(
+    def use(
         self,
         *,
         max_attempts: int | None = None,
         deadline: float | None = None,
         retry_delay: float = 0.5,
     ) -> Callable[[Callable[..., Awaitable[R]]], Callable[..., Awaitable[R]]]:
-        """Decorator factory: wrap a callable so every call goes through ``self.run()``
-        with resource rotation and retry.
+        """Decorator factory: wrap a callable so every call goes through ``self.run()``,
+        with resource selection (per pool ``strategy``) and retry handled for you.
 
         The decorated function receives a ``Resource[T]`` as its first positional
         argument (injected by the wrapper), followed by whatever the caller passes.
@@ -502,7 +502,7 @@ async def call(resource):
 result = asyncio.run(pool.run(call))
 
 # Decorator form -- `resource` is injected as the first arg:
-@pool.rotated()
+@pool.use()
 async def fetch(resource, url): ...
 ```
 

@@ -62,7 +62,7 @@ class TestSelection:
         tally: Counter[str] = Counter()
         gate = asyncio.Event()
 
-        @pool.rotated()
+        @pool.use()
         def op(r: Resource[str]) -> asyncio.Future[str]:
             tally[r.resource_id] += 1
             fut: asyncio.Future[str] = asyncio.get_event_loop().create_future()
@@ -759,22 +759,22 @@ class TestOperationShape:
         assert snap["status"] == "healthy"
         assert snap["in_flight"] == 0
 
-    async def test_g3_rotated_accepts_sync_and_async(self):
-        """@rotated works with async def, sync returning coroutine, sync returning Future."""
+    async def test_g3_use_accepts_sync_and_async(self):
+        """@use works with async def, sync returning coroutine, sync returning Future."""
         pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
 
-        @pool.rotated()
+        @pool.use()
         async def op_async(r: Resource[str]) -> str:
             return f"async-{r.value}"
 
         async def _helper(r: Resource[str]) -> str:  # NOSONAR S7503
             return f"coro-{r.value}"
 
-        @pool.rotated()
+        @pool.use()
         def op_sync_coro(r: Resource[str]):
             return _helper(r)
 
-        @pool.rotated()
+        @pool.use()
         def op_sync_future(r: Resource[str]):
             return _ok_future(f"future-{r.value}")
 
@@ -862,12 +862,12 @@ class TestAPI:
         assert snap["r0"]["status"] == "cooling_down"
         assert snap["r0"]["cooldown_seconds_remaining"] > 0
 
-    async def test_h6_rotated_forwards_args(self):
-        """@rotated passes positional and keyword args through."""
+    async def test_h6_use_forwards_args(self):
+        """@use passes positional and keyword args through."""
         pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
         captured: dict[str, Any] = {}
 
-        @pool.rotated()
+        @pool.use()
         def op(
             r: Resource[str], x: int, y: int, *, opt: int = 1
         ) -> asyncio.Future[str]:
