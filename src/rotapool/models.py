@@ -9,7 +9,7 @@ T = TypeVar("T")
 
 @dataclass
 class Resource(Generic[T]):
-    """A single rotatable resource.
+    """A single pooled resource.
 
     `cooldown_until` and `last_acquired_at` are `time.monotonic()` readings, not epoch
     timestamps. They are only meaningful when compared to another `time.monotonic()`

@@ -117,12 +117,44 @@ result = await pool.run(
 
 ### Selection
 
-When multiple resources are healthy, the pool picks the one with:
+Among resources that are not disabled, not cooling down, and not at `max_in_flight`, the pool picks one according to its `strategy`:
 
-1. **Fewest in-flight usages** (load spreading)
-2. **Oldest `last_acquired_at`** (round-robin fairness)
+- **`"round_robin"` (default)** — fewest in-flight usages first, then oldest `last_acquired_at`. Best-effort fairness across resources; the pool can't predict how long a usage will hold a slot, so this only balances by acquisition time.
+- **`"primary_backup"`** — return the first eligible resource in the original list/dict order. Later resources are only used when earlier ones are cooling down, disabled, or at capacity. Resource ordering is load-bearing under this strategy.
 
 Selection and usage registration are atomic under one lock acquisition.
+
+#### Example: `primary_backup` for a paid-tier primary with a free-tier fallback
+
+Send every request to the paid key first; only spill over to the free key when the primary is rate-limited (cooling down) or the paid quota is exhausted (disabled). Resource ordering in the list is the priority ranking — the pool will never reach for `free-fallback` while `paid-primary` is still healthy and below capacity.
+
+```python
+pool = Pool(
+    resources=[
+        Resource(resource_id="paid-primary", value="sk-paid-..."),
+        Resource(resource_id="free-fallback", value="sk-free-..."),
+    ],
+    strategy="primary_backup",
+)
+```
+
+#### Example: `primary_backup` with a capacity cap to fan out under bursts
+
+Combine `max_in_flight` on the primary with `primary_backup` to get "use the primary up to N concurrent calls, then overflow to the next tier." Useful when the primary is fastest/cheapest but has a hard concurrency limit you don't want to breach.
+
+```python
+pool = Pool(
+    resources=[
+        Resource(resource_id="region-us",   value=us_client,   max_in_flight=8),
+        Resource(resource_id="region-eu",   value=eu_client,   max_in_flight=8),
+        Resource(resource_id="region-asia", value=asia_client),
+    ],
+    strategy="primary_backup",
+)
+# 1st–8th concurrent calls -> region-us
+# 9th–16th             -> region-eu (us is at capacity)
+# 17th+                -> region-asia (eu is at capacity)
+```
 
 ### Cooldown escalation
 

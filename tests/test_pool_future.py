@@ -118,6 +118,54 @@ class TestSelection:
         result = await pool.run(quick)
         assert result == "r0"
 
+    async def test_a3_primary_backup_prefers_first_eligible(self):
+        """primary_backup: pick the first eligible resource in list order."""
+        pool = Pool(
+            resources=_res(3),
+            cooldown_table=FAST_TABLE,
+            strategy="primary_backup",
+        )
+        # All healthy: every call should land on r0.
+        results = [await pool.run(_id_future) for _ in range(5)]
+        assert results == ["v0", "v0", "v0", "v0", "v0"]
+
+        # When r0 is at capacity, r1 is chosen; r2 stays untouched.
+        cap_pool: Pool[str] = Pool(
+            resources=[
+                Resource(resource_id="r0", value="v0", max_in_flight=1),
+                Resource(resource_id="r1", value="v1"),
+                Resource(resource_id="r2", value="v2"),
+            ],
+            cooldown_table=FAST_TABLE,
+            strategy="primary_backup",
+        )
+        hold = asyncio.Event()
+        acquired: list[str] = []
+
+        def op(r: Resource[str]) -> asyncio.Future[str]:
+            acquired.append(r.resource_id)
+            fut: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+
+            async def _wait() -> None:
+                await hold.wait()
+                if not fut.done():
+                    fut.set_result(r.resource_id)
+
+            _spawn(_wait())
+            return fut
+
+        t0 = asyncio.create_task(cap_pool.run(op))
+        t1 = asyncio.create_task(cap_pool.run(op))
+        await asyncio.sleep(0.05)
+        assert acquired == ["r0", "r1"]
+        hold.set()
+        await asyncio.gather(t0, t1)
+
+    async def test_a4_invalid_strategy_raises(self):  # noqa: S7503
+        """Pool rejects unknown strategy strings at construction."""
+        with pytest.raises(ValueError, match="strategy must be"):
+            Pool(resources=_res(1), strategy="bogus")  # type: ignore[arg-type]
+
 
 # ===================================================================
 # Group B — Retry & transparent failover
