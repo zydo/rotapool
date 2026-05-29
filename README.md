@@ -109,7 +109,7 @@ async def call_upstream(resource, url, payload):
 result = await pool.run(
     lambda resource: call_upstream(resource, "https://api.example.com/v1/chat", {"prompt": "hi"}),
     max_attempts=None,               # Override the pool's max_attempts for this call only
-    deadline=time.monotonic() + 30,  # Absolute time.monotonic() deadline bounding total retry time
+    deadline=time.monotonic() + 30,  # Gates the start of each attempt (not in-flight work); None = no deadline
     retry_delay=0.5,                 # Seconds to pause between failed attempts
     request_id="req-abc",            # Opaque string attached to every Usage; auto-UUID when None
 )
@@ -236,8 +236,10 @@ await pool.run(
     # max_attempts:    Per-call override of the pool's max_attempts. None = use pool default.
 
     deadline: float | None = None,
-    # deadline:        Absolute time.monotonic() value bounding total time across
-    #                  retries. Raises PoolExhausted if exceeded. None = no deadline.
+    # deadline:        Absolute time.monotonic() value that gates when each attempt may
+    #                  start and caps the inter-attempt pause. Does NOT interrupt an
+    #                  in-flight operation, so a single long call can overrun it. Raises
+    #                  PoolExhausted when a new attempt would start past it. None = none.
 
     retry_delay: float = 0.5,
     # retry_delay:     Seconds to pause between failed attempts.

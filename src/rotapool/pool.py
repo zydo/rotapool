@@ -131,8 +131,12 @@ class Pool(AgentReadableMixin, Generic[T]):
             This is a total budget across resource switches, not per resource.
             Effective value is ``min(max_attempts, len(resources))``.
 
-        deadline: absolute time.monotonic() value bounding total time across retries.
-            None disables the deadline.
+        deadline: absolute time.monotonic() value that gates when each attempt may
+            start. It is checked before every attempt and caps the inter-attempt retry
+            pause, so run() will neither begin new work nor keep sleeping past it. It
+            does NOT interrupt an operation already in flight -- a single call that runs
+            long can overrun the deadline, because the pool never cancels a usage that
+            may already have upstream side effects. None disables the deadline.
 
         retry_delay: pause between failed attempts to let cooling resources recover and
             to avoid hammering the pool.
@@ -186,14 +190,14 @@ class Pool(AgentReadableMixin, Generic[T]):
                 await self._on_cooldown(usage, cooldown_seconds=e.cooldown_seconds)
                 last_error = e
                 if attempt_num < effective_attempts - 1:
-                    await asyncio.sleep(retry_delay)
+                    await self._sleep_before_retry(retry_delay, deadline)
                 continue
 
             except DisableResource as e:
                 await self._on_disable(usage)
                 last_error = e
                 if attempt_num < effective_attempts - 1:
-                    await asyncio.sleep(retry_delay)
+                    await self._sleep_before_retry(retry_delay, deadline)
                 continue
 
             except asyncio.CancelledError:
@@ -210,7 +214,7 @@ class Pool(AgentReadableMixin, Generic[T]):
                     raise
                 last_error = asyncio.CancelledError()
                 if attempt_num < effective_attempts - 1:
-                    await asyncio.sleep(retry_delay)
+                    await self._sleep_before_retry(retry_delay, deadline)
                 continue
 
             except Exception:
@@ -463,6 +467,19 @@ class Pool(AgentReadableMixin, Generic[T]):
                 other.status = "cancelled"
                 to_cancel.append(other)
         return to_cancel
+
+    @staticmethod
+    async def _sleep_before_retry(retry_delay: float, deadline: float | None) -> None:
+        """Pause between attempts without sleeping past the deadline.
+
+        The deadline gates when the next attempt may start; it never interrupts an
+        in-flight operation. Capping the pause here keeps run() from blocking past the
+        deadline while merely waiting to retry.
+        """
+        delay = retry_delay
+        if deadline is not None:
+            delay = min(retry_delay, max(deadline - time.monotonic(), 0.0))
+        await asyncio.sleep(delay)
 
     @staticmethod
     def _cancel_tasks(usages: list[Usage]) -> None:
