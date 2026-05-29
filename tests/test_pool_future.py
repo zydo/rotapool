@@ -891,3 +891,19 @@ class TestAPI:
             await pool.run(always_cool, max_attempts=1, retry_delay=0.01)
 
         assert sum(tally.values()) == 1
+
+    def test_h8_construction_rejects_bad_max_attempts(self):
+        """max_attempts < 1 at construction → ValueError."""
+        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+            Pool(resources=_res(1), max_attempts=0)
+
+    def test_h9_construction_rejects_empty_cooldown_table(self):
+        """Empty cooldown_table → ValueError at construction."""
+        with pytest.raises(ValueError, match="cooldown_table must contain"):
+            Pool(resources=_res(1), cooldown_table=())
+
+    async def test_h10_run_rejects_bad_max_attempts(self):
+        """Per-call max_attempts < 1 → ValueError before any attempt."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+            await pool.run(_id_future, max_attempts=0)

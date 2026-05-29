@@ -81,7 +81,12 @@ class Pool(AgentReadableMixin, Generic[T]):
         if not self._resources:
             raise ValueError("Pool requires at least one resource")
 
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
         self._max_attempts: int = max_attempts
+
+        if not cooldown_table:
+            raise ValueError("cooldown_table must contain at least one entry")
         self._cooldown_table: tuple[float, ...] = cooldown_table
 
         # Runtime guard for callers that bypass type checking. Cast widens the
@@ -146,6 +151,8 @@ class Pool(AgentReadableMixin, Generic[T]):
             caller (e.g. an HTTP request-id header). Auto-generated UUID when None.
         """
         rid = request_id or str(uuid.uuid4())
+        if max_attempts is not None and max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
         cap = max_attempts if max_attempts is not None else self._max_attempts
         effective_attempts = min(cap, len(self._resources))
         last_error: BaseException | None = None
