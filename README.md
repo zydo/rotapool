@@ -214,6 +214,13 @@ pool = Pool(
     # cooldown_table:  Escalation table indexed by consecutive_cooldown count.
     #                  1st cooldown → cooldown_table[0], 2nd → cooldown_table[1], etc.
     #                  Out-of-range values clamp to the last entry.
+
+    strategy: Literal["round_robin", "primary_backup"] = "round_robin",
+    # strategy:        Selection policy among eligible resources. "round_robin"
+    #                  (default) balances by fewest in-flight, then oldest
+    #                  last_acquired_at. "primary_backup" returns the first eligible
+    #                  resource in list/dict order (ordering is the priority ranking).
+    #                  Pool-level by design; not overridable per call. See "Selection".
 )
 ```
 
