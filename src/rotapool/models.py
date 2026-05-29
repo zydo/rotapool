@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
 T = TypeVar("T")
@@ -17,7 +17,9 @@ class Resource(Generic[T]):
     """
 
     resource_id: str
-    value: T
+    # repr=False: value is often a secret (API key, token); keep it out of reprs,
+    # tracebacks, and logs.
+    value: T = field(repr=False)
 
     max_in_flight: int | None = None  # None = unbounded concurrency
     status: str = "healthy"
