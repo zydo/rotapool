@@ -788,6 +788,48 @@ class TestCancellation:
         assert snap["status"] == "cooling_down"
         assert snap["consecutive_cooldown"] == 1
 
+    async def test_e7_external_cancel_propagates_for_uncancellable_awaitable(
+        self,
+    ) -> None:
+        """Awaitable shape only: a sibling cooldown marks the usage 'cancelled' but
+        has no handle to actually cancel it. A subsequent CancelledError can therefore
+        only be external (caller cancellation) and must propagate, not be swallowed
+        as an internal retry.
+        """
+        pool = Pool(resources=_res(1), max_attempts=3, cooldown_table=FAST_TABLE)
+
+        trigger_started = asyncio.Event()
+        waiter_started = asyncio.Event()
+        release = asyncio.Event()  # never set; waiter blocks until cancelled
+
+        async def trigger_body(_: Resource[str]) -> Any:
+            trigger_started.set()
+            await asyncio.sleep(0.05)
+            raise CooldownResource(cooldown_seconds=10.0, reason="hot")
+
+        async def waiter_body(_: Resource[str]) -> str:
+            waiter_started.set()
+            await release.wait()
+            return "never"
+
+        def waiter_op(r: Resource[str]) -> Awaitable[str]:
+            return _Aw(waiter_body(r))
+
+        trigger_task = asyncio.create_task(pool.run(trigger_body))
+        await trigger_started.wait()
+        waiter_task = asyncio.create_task(pool.run(waiter_op))
+        await waiter_started.wait()
+
+        # Trigger's cooldown marks the younger waiter 'cancelled' (cancel no-ops).
+        with pytest.raises(PoolExhausted):
+            await trigger_task
+
+        waiter_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter_task
+
+        assert pool.snapshot()["r0"]["in_flight"] == 0
+
 
 # ===================================================================
 # Group F — Concurrency & saturation
@@ -1006,6 +1048,20 @@ class TestAPI:
         """Empty cooldown_table → ValueError at construction."""
         with pytest.raises(ValueError, match="cooldown_table must contain"):
             Pool(resources=_res(1), cooldown_table=())
+
+    def test_h11_construction_rejects_negative_cooldown(self) -> None:
+        """Negative cooldown_table entry → ValueError at construction."""
+        with pytest.raises(ValueError, match="cooldown_table entries must be >= 0"):
+            Pool(resources=_res(1), cooldown_table=(30.0, -1.0))
+
+    def test_h12_dict_key_must_match_resource_id(self) -> None:
+        """Dict key differing from resource_id → ValueError at construction.
+
+        A mismatch would silently break health tracking: usages are keyed by
+        resource_id, so cooldown/disable lookups would miss the resource.
+        """
+        with pytest.raises(ValueError, match="does not match resource_id"):
+            Pool(resources={"alias": Resource(resource_id="real", value="v")})
 
     async def test_h10_run_rejects_bad_max_attempts(self) -> None:
         """Per-call max_attempts < 1 → ValueError before any attempt."""

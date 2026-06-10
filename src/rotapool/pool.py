@@ -87,6 +87,8 @@ class Pool(AgentReadableMixin, Generic[T]):
 
         if not cooldown_table:
             raise ValueError("cooldown_table must contain at least one entry")
+        if any(cd < 0 for cd in cooldown_table):
+            raise ValueError("cooldown_table entries must be >= 0")
         self._cooldown_table: tuple[float, ...] = cooldown_table
 
         # Runtime guard for callers that bypass type checking. Cast widens the
@@ -213,9 +215,13 @@ class Pool(AgentReadableMixin, Generic[T]):
                 # _on_disable" (swallow and retry). _collect_younger_usages_locked sets
                 # usage.status = "cancelled" under the lock *before* invoking .cancel()
                 # on the handle, so seeing "cancelled" here means a sibling on the same
-                # resource cancelled us. Works on any Python 3.10+ (no
-                # asyncio.Task.cancelling() dependency). Cleanup runs in finally.
-                cancelled_internally = usage.status == "cancelled"
+                # resource cancelled us. With no cancel handle (usage.task is None) the
+                # pool could not have delivered this error even if a sibling marked the
+                # usage cancelled, so it must be external. Works on any Python 3.10+
+                # (no asyncio.Task.cancelling() dependency). Cleanup runs in finally.
+                cancelled_internally = (
+                    usage.status == "cancelled" and usage.task is not None
+                )
                 usage.status = "cancelled"
                 if not cancelled_internally:
                     raise
@@ -309,6 +315,11 @@ class Pool(AgentReadableMixin, Generic[T]):
                     )
                 result[r.resource_id] = r
             return result
+        for key, r in resources.items():
+            if key != r.resource_id:
+                raise ValueError(
+                    f"dict key {key!r} does not match resource_id {r.resource_id!r}"
+                )
         return dict(resources)
 
     async def _acquire(self, request_id: str) -> tuple[Resource[T], Usage] | None:
@@ -348,13 +359,13 @@ class Pool(AgentReadableMixin, Generic[T]):
                 # so the first one is the highest-priority eligible resource.
                 selected = candidates[0]
             else:
-                candidates.sort(
+                selected = min(
+                    candidates,
                     key=lambda r: (
                         len(self._inflight_by_resource.get(r.resource_id, set())),
                         r.last_acquired_at,
-                    )
+                    ),
                 )
-                selected = candidates[0]
             selected.last_acquired_at = now
             usage = Usage(
                 usage_id=str(uuid.uuid4()),
