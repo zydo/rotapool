@@ -1148,6 +1148,28 @@ class TestAPI:
         assert uniform_args == [(0.5, 1.5)]
         assert sleeps == [pytest.approx(0.2 * 1.5)]
 
+    async def test_h18_snapshot_reports_expired_cooldown_as_healthy(self) -> None:
+        """An expired cooldown reads as healthy in snapshot() even though the stored
+        status only flips lazily on the next _acquire. Snapshot stays read-only."""
+        pool = Pool(resources=_res(1), cooldown_table=(0.01,))
+
+        async def op(r: Resource[str]) -> str:  # NOSONAR
+            raise CooldownResource(reason="busy")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(op, retry_delay=0)
+
+        assert pool.snapshot()["r0"]["status"] == "cooling_down"
+
+        await asyncio.sleep(0.03)
+        snap = pool.snapshot()["r0"]
+        assert snap["status"] == "healthy"
+        assert snap["cooldown_seconds_remaining"] == 0.0
+        # Read-only: the stored status still says cooling_down until next acquire.
+        assert (
+            pool._resources["r0"].status == "cooling_down"
+        )  # pyright: ignore[reportPrivateUsage] # NOSONAR
+
     def test_h16_resource_rejects_empty_resource_id(self) -> None:
         """Empty resource_id → ValueError at Resource construction."""
         with pytest.raises(ValueError, match="resource_id must be a non-empty"):

@@ -319,11 +319,17 @@ class Pool(AgentReadableMixin, Generic[T]):
         result: dict[str, dict[str, Any]] = {}
         for rid, r in self._resources.items():
             inflight = len(self._inflight_by_resource.get(rid, set()))
+            # The stored status flips to "healthy" lazily inside _acquire, so an
+            # expired cooldown can linger as "cooling_down" on an idle pool. Report
+            # the effective status without mutating state (snapshot is lock-free).
+            status = r.status
+            if status == "cooling_down" and r.cooldown_until <= now:
+                status = "healthy"
             cooldown_remaining = (
-                max(r.cooldown_until - now, 0.0) if r.status == "cooling_down" else 0.0
+                max(r.cooldown_until - now, 0.0) if status == "cooling_down" else 0.0
             )
             result[rid] = {
-                "status": r.status,
+                "status": status,
                 "in_flight": inflight,
                 "consecutive_cooldown": r.consecutive_cooldown,
                 "cooldown_seconds_remaining": cooldown_remaining,

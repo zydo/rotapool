@@ -279,6 +279,8 @@ await pool.run(
 ```python
 pool.snapshot() -> dict[str, dict[str, Any]]
 # Returns a point-in-time summary of every resource. Thread-safe without the lock.
+# A resource whose cooldown has expired is reported as "healthy" even though the
+# stored status only flips on the next acquire.
 # Example return value:
 # {
 #     "key-1": {
