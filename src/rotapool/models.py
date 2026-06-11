@@ -30,6 +30,14 @@ class Resource(Generic[T]):
     last_acquired_at: float = 0.0
     consecutive_cooldown: int = 0
 
+    def __post_init__(self) -> None:
+        if not self.resource_id:
+            raise ValueError("resource_id must be a non-empty string")
+        if self.max_in_flight is not None and self.max_in_flight < 1:
+            raise ValueError(
+                f"max_in_flight must be >= 1 or None, got {self.max_in_flight}"
+            )
+
 
 @dataclass
 class Usage:

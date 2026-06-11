@@ -297,13 +297,14 @@ pool.snapshot() -> dict[str, dict[str, Any]]
 ```python
 resource = Resource(
     resource_id: str,
-    # resource_id:          Unique identifier for this resource.
+    # resource_id:          Unique identifier for this resource. Must be non-empty.
 
     value: T,
     # value:                The actual resource object (API key, proxy URL, etc.).
 
     max_in_flight: int | None = None,
     # max_in_flight:        Maximum concurrent usages. None = unlimited, 1 = exclusive.
+    #                       Must be >= 1 or None.
 
     status: Literal["healthy", "cooling_down", "disabled"] = "healthy",
     # status:               Current health. Managed by the framework — do not set

@@ -1147,3 +1147,15 @@ class TestAPI:
         # One sleep between the two attempts; no sleep after the final attempt.
         assert uniform_args == [(0.5, 1.5)]
         assert sleeps == [pytest.approx(0.2 * 1.5)]
+
+    def test_h16_resource_rejects_empty_resource_id(self) -> None:
+        """Empty resource_id → ValueError at Resource construction."""
+        with pytest.raises(ValueError, match="resource_id must be a non-empty"):
+            Resource(resource_id="", value="v")
+
+    def test_h17_resource_rejects_bad_max_in_flight(self) -> None:
+        """max_in_flight < 1 → ValueError at Resource construction; None is fine."""
+        with pytest.raises(ValueError, match="max_in_flight must be >= 1 or None"):
+            Resource(resource_id="r0", value="v", max_in_flight=0)
+        Resource(resource_id="r0", value="v", max_in_flight=None)
+        Resource(resource_id="r0", value="v", max_in_flight=1)
