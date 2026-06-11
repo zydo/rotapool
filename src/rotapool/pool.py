@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import random
 import time
 import uuid
 from typing import (
@@ -168,8 +169,11 @@ class Pool(AgentReadableMixin, Generic[T]):
             long can overrun the deadline, because the pool never cancels a usage that
             may already have upstream side effects. None disables the deadline.
 
-        retry_delay: pause between failed attempts to let cooling resources recover and
-            to avoid hammering the pool. Must be >= 0.
+        retry_delay: base pause between failed attempts to let cooling resources
+            recover and to avoid hammering the pool. Must be >= 0. The actual pause
+            is jittered to ``retry_delay * uniform(0.5, 1.5)`` (mean stays
+            ``retry_delay``) so concurrent callers do not retry in lockstep and
+            stampede the next eligible resource.
 
         request_id: opaque string attached to every `Usage` created by this call.
             Useful for correlating logs, metrics, or tracing back to the original
@@ -515,13 +519,18 @@ class Pool(AgentReadableMixin, Generic[T]):
     async def _sleep_before_retry(retry_delay: float, deadline: float | None) -> None:
         """Pause between attempts without sleeping past the deadline.
 
+        The pause is jittered to ``retry_delay * uniform(0.5, 1.5)`` so concurrent
+        run() calls that failed on the same resource at the same moment do not retry
+        in lockstep and stampede the next eligible resource. The mean stays
+        ``retry_delay``; zero stays zero.
+
         The deadline gates when the next attempt may start; it never interrupts an
         in-flight operation. Capping the pause here keeps run() from blocking past the
         deadline while merely waiting to retry.
         """
-        delay = retry_delay
+        delay = retry_delay * random.uniform(0.5, 1.5)
         if deadline is not None:
-            delay = min(retry_delay, max(deadline - time.monotonic(), 0.0))
+            delay = min(delay, max(deadline - time.monotonic(), 0.0))
         await asyncio.sleep(delay)
 
     @staticmethod

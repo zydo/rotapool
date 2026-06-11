@@ -1114,3 +1114,36 @@ class TestAPI:
             else:
                 sys.modules["agent_readable"] = saved
             importlib.reload(pool_module)
+
+    async def test_h15_retry_delay_is_jittered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The inter-attempt pause is retry_delay * uniform(0.5, 1.5), so concurrent
+        callers failing at the same moment don't retry in lockstep."""
+        import random
+
+        pool = Pool(resources=_res(2), cooldown_table=FAST_TABLE)
+        uniform_args: list[tuple[float, float]] = []
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
+
+        def fake_uniform(a: float, b: float) -> float:
+            uniform_args.append((a, b))
+            return 1.5
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+            await real_sleep(0)
+
+        monkeypatch.setattr(random, "uniform", fake_uniform)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        async def op(r: Resource[str]) -> str:  # NOSONAR
+            raise CooldownResource(reason="busy")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(op, retry_delay=0.2)
+
+        # One sleep between the two attempts; no sleep after the final attempt.
+        assert uniform_args == [(0.5, 1.5)]
+        assert sleeps == [pytest.approx(0.2 * 1.5)]

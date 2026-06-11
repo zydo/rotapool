@@ -60,7 +60,7 @@ pool = Pool(
 @pool.use(
     max_attempts=None,       # Override the pool's max_attempts for this decorated function
     deadline=None,           # Absolute time.monotonic() deadline; None = no deadline
-    retry_delay=0.5,         # Seconds to pause between failed attempts
+    retry_delay=0.5,         # Base pause between failed attempts (jittered ±50%)
 )
 async def call_upstream(resource, url, payload):
     async with httpx.AsyncClient() as client:
@@ -110,7 +110,7 @@ result = await pool.run(
     lambda resource: call_upstream(resource, "https://api.example.com/v1/chat", {"prompt": "hi"}),
     max_attempts=None,               # Override the pool's max_attempts for this call only
     deadline=time.monotonic() + 30,  # Gates the start of each attempt (not in-flight work); None = no deadline
-    retry_delay=0.5,                 # Seconds to pause between failed attempts
+    retry_delay=0.5,                 # Base pause between failed attempts (jittered ±50%)
     request_id="req-abc",            # Opaque string attached to every Usage; auto-UUID when None
 )
 ```
@@ -190,6 +190,8 @@ Cancellation is **best-effort**: it works when the operation returns a coroutine
 
 `pool.run()` drives the retry loop. `@pool.use()` is a thin decorator shim over it. Attempts are capped at `min(max_attempts, len(resources))` — more retries than resources is pointless.
 
+The pause between attempts is jittered: `retry_delay * uniform(0.5, 1.5)`, mean `retry_delay`. Without jitter, concurrent calls that hit the same cooldown would all wake at the same instant and stampede the next eligible resource.
+
 ### Cancellation discrimination
 
 The framework distinguishes external cancellation (client disconnect, shutdown — re-raised) from internal cancellation (resource failure — swallowed and retried) by checking `usage.status`. The cooldown/disable handler sets the status to `"cancelled"` under the pool lock *before* invoking `.cancel()` on the handle, so observing that status when `CancelledError` arrives reliably means "we cancelled ourselves." Works on any Python 3.10+.
@@ -250,7 +252,10 @@ await pool.run(
     #                  PoolExhausted when a new attempt would start past it. None = none.
 
     retry_delay: float = 0.5,
-    # retry_delay:     Seconds to pause between failed attempts. Must be >= 0.
+    # retry_delay:     Base pause (seconds) between failed attempts. Must be >= 0.
+    #                  The actual pause is jittered to retry_delay * uniform(0.5, 1.5)
+    #                  (mean stays retry_delay) so concurrent callers don't retry in
+    #                  lockstep and stampede the next eligible resource.
 
     request_id: str | None = None,
     # request_id:      Opaque string attached to every Usage created by this call.
@@ -262,7 +267,7 @@ await pool.run(
 @pool.use(
     max_attempts: int | None = None,     # Per-call override; None = use pool default
     deadline: float | None = None,       # Absolute time.monotonic() deadline
-    retry_delay: float = 0.5,            # Pause between failed attempts
+    retry_delay: float = 0.5,            # Base pause between failed attempts (jittered ±50%)
 )
 # Returns a decorator. The decorated function receives a Resource[T] as its
 # first positional argument (injected by the wrapper), followed by caller args.
