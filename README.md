@@ -2,7 +2,7 @@
 
 Async resource pool with inline health feedback, automatic cooldown, and retry — for API keys, proxies, GPU workers, or anything that can rate-limit you or go down.
 
-> **Designed for AI coding agents,** `rotapool` exposes machine-readable usage notes via [agent-readable](https://github.com/zydo/agent-readable). When generating code that uses `Pool`, tell your coding agent to run `pip install agent-readable` and then `python -m agent_readable rotapool.Pool` to learn about the operation contract, do/don't rules, anti-patterns, and failure modes.
+> **Designed for AI coding agents,** `rotapool` exposes machine-readable usage notes via [agent-readable](https://github.com/zydo/agent-readable). When generating code that uses `Pool`, tell your coding agent to run `pip install agent-readable` and then `python -m agent_readable rotapool.Pool` to learn about the operation contract, do/don't rules, anti-patterns, and failure modes. `agent-readable` is an optional dependency — `rotapool` works identically without it.
 
 ## Core idea
 
@@ -26,7 +26,7 @@ pip install rotapool
 uv add rotapool
 ```
 
-Requires Python 3.10+.
+Requires Python 3.10+. Zero runtime dependencies; `pip install "rotapool[agent]"` adds the optional [agent-readable](https://github.com/zydo/agent-readable) integration.
 
 ## Quick start
 

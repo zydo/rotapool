@@ -5,9 +5,31 @@ import functools
 import inspect
 import time
 import uuid
-from typing import Any, Awaitable, Callable, Generic, Literal, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Generic,
+    Literal,
+    TypeVar,
+    cast,
+)
 
-from agent_readable import AgentReadableMixin
+if TYPE_CHECKING:
+    from agent_readable import AgentReadableMixin
+else:
+    try:
+        from agent_readable import AgentReadableMixin
+    except ImportError:
+
+        class AgentReadableMixin:
+            """No-op stand-in when the optional agent-readable package is absent.
+
+            Pool's ``__agent_notes__`` still exists; only the auto-generated
+            ``__agent_help__`` introspection from the real mixin is lost.
+            """
+
 
 from .exceptions import CooldownResource, DisableResource, PoolExhausted
 from .models import Resource, Usage

@@ -389,7 +389,9 @@ wheels = [
 name = "rotapool"
 version = "0.1.2"
 source = { editable = "." }
-dependencies = [
+
+[package.optional-dependencies]
+agent = [
     { name = "agent-readable" },
 ]
 
@@ -403,7 +405,8 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "agent-readable", specifier = ">=0.1.0" }]
+requires-dist = [{ name = "agent-readable", marker = "extra == 'agent'", specifier = ">=0.1.0" }]
+provides-extras = ["agent"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -27,7 +27,10 @@ classifiers = [
     "Framework :: AsyncIO",
     "Typing :: Typed",
 ]
-dependencies = ["agent-readable>=0.1.0"]
+dependencies = []
+
+[project.optional-dependencies]
+agent = ["agent-readable>=0.1.0"]
 
 [project.urls]
 Source = "https://github.com/zydo/rotapool"
@@ -55,6 +58,7 @@ omit = ["tests/*"]
 
 [tool.coverage.report]
 show_missing = true
+exclude_also = ["if TYPE_CHECKING:"]
 
 [tool.pyright]
 venvPath = "."

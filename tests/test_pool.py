@@ -1082,3 +1082,35 @@ class TestAPI:
 
         with pytest.raises(ValueError, match="retry_delay must be >= 0"):
             await pool.run(op, retry_delay=-0.1)
+
+    async def test_h14_works_without_agent_readable(self) -> None:
+        """agent-readable is optional: with its import blocked, the module falls
+        back to the no-op mixin and the pool still runs operations end to end."""
+        import importlib
+        import sys
+
+        import rotapool.pool as pool_module
+
+        saved = sys.modules.get("agent_readable")
+        # A None entry in sys.modules makes `import agent_readable` raise
+        # ModuleNotFoundError, exercising the fallback branch.
+        sys.modules["agent_readable"] = None  # type: ignore[assignment]
+        try:
+            reloaded = importlib.reload(pool_module)
+            assert "agent_readable" not in reloaded.AgentReadableMixin.__module__
+
+            pool = reloaded.Pool(
+                resources=[Resource(resource_id="r0", value="v0")],
+                cooldown_table=FAST_TABLE,
+            )
+
+            async def op(r: Resource[str]) -> str:  # NOSONAR
+                return r.value
+
+            assert await pool.run(op) == "v0"
+        finally:
+            if saved is None:
+                sys.modules.pop("agent_readable", None)
+            else:
+                sys.modules["agent_readable"] = saved
+            importlib.reload(pool_module)
