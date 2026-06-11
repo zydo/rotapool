@@ -205,10 +205,11 @@ pool = Pool(
     #                  Duplicate resource_ids in list form raise ValueError.
 
     max_attempts: int = 3,
-    # max_attempts:    Total retry budget per run() call. Each attempt picks a fresh
-    #                  resource. Effectively capped at len(resources) — once every
-    #                  resource has been tried and none is eligible, run() raises
-    #                  PoolExhausted rather than retrying any one twice.
+    # max_attempts:    Total retry budget per run() call. Each attempt picks among
+    #                  currently eligible resources — one that triggered cooldown or
+    #                  disable stays ineligible while that state lasts (a zero-second
+    #                  cooldown can make it eligible again immediately). Effectively
+    #                  capped at len(resources); raises PoolExhausted once spent.
 
     cooldown_table: tuple[float, ...] = (30.0, 120.0, 300.0, 600.0),
     # cooldown_table:  Escalation table indexed by consecutive_cooldown count.
@@ -249,7 +250,7 @@ await pool.run(
     #                  PoolExhausted when a new attempt would start past it. None = none.
 
     retry_delay: float = 0.5,
-    # retry_delay:     Seconds to pause between failed attempts.
+    # retry_delay:     Seconds to pause between failed attempts. Must be >= 0.
 
     request_id: str | None = None,
     # request_id:      Opaque string attached to every Usage created by this call.
@@ -438,8 +439,8 @@ When a resource raises `CooldownResource` or `DisableResource`, the framework ca
 ## Testing
 
 ```bash
-# pip
-pip install -e ".[dev]"
+# pip (>= 25.1 for --group)
+pip install -e . --group dev
 pytest
 
 # uv

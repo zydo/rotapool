@@ -1072,3 +1072,13 @@ class TestAPI:
 
         with pytest.raises(ValueError, match="max_attempts must be >= 1"):
             await pool.run(op, max_attempts=0)
+
+    async def test_h13_run_rejects_negative_retry_delay(self) -> None:
+        """Per-call retry_delay < 0 → ValueError before any attempt."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        async def op(r: Resource[str]) -> str:  # NOSONAR
+            return r.value
+
+        with pytest.raises(ValueError, match="retry_delay must be >= 0"):
+            await pool.run(op, retry_delay=-0.1)

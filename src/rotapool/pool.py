@@ -48,11 +48,12 @@ class Pool(AgentReadableMixin, Generic[T]):
             are higher-priority. Must contain at least one entry.
 
         max_attempts: default total retry budget per ``run()`` call (not per resource).
-            Each attempt selects a fresh resource via the pool's selection rules; a
-            resource that triggered cooldown or disable on one attempt is skipped on
-            the next. Effective cap is ``min(max_attempts, len(resources))`` -- once
-            every resource has been tried and none is eligible, ``run()`` raises
-            ``PoolExhausted`` rather than retrying the same resource twice.
+            Each attempt selects a resource via the pool's selection rules; a resource
+            that triggered cooldown or disable on one attempt is ineligible on the
+            next while that state lasts (a zero-second cooldown can make it eligible
+            again immediately, in which case it may be re-selected). Effective cap is
+            ``min(max_attempts, len(resources))`` -- a budget larger than the pool is
+            pointless, so ``run()`` raises ``PoolExhausted`` once it is spent.
             Overridable per call via ``run(..., max_attempts=...)``.
 
         cooldown_table: cooldown durations (seconds) indexed by ``consecutive_cooldown``
@@ -146,7 +147,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             may already have upstream side effects. None disables the deadline.
 
         retry_delay: pause between failed attempts to let cooling resources recover and
-            to avoid hammering the pool.
+            to avoid hammering the pool. Must be >= 0.
 
         request_id: opaque string attached to every `Usage` created by this call.
             Useful for correlating logs, metrics, or tracing back to the original
@@ -155,6 +156,8 @@ class Pool(AgentReadableMixin, Generic[T]):
         rid = request_id or str(uuid.uuid4())
         if max_attempts is not None and max_attempts < 1:
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+        if retry_delay < 0:
+            raise ValueError(f"retry_delay must be >= 0, got {retry_delay}")
         cap = max_attempts if max_attempts is not None else self._max_attempts
         effective_attempts = min(cap, len(self._resources))
         last_error: BaseException | None = None
