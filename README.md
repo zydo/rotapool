@@ -305,9 +305,9 @@ resource = Resource(
     max_in_flight: int | None = None,
     # max_in_flight:        Maximum concurrent usages. None = unlimited, 1 = exclusive.
 
-    status: str = "healthy",
-    # status:               Current health: "healthy", "cooling_down", or "disabled".
-    #                       Managed by the framework — do not set manually.
+    status: Literal["healthy", "cooling_down", "disabled"] = "healthy",
+    # status:               Current health. Managed by the framework — do not set
+    #                       manually.
 
     cooldown_until: float = 0.0,
     # cooldown_until:       time.monotonic() deadline when status is "cooling_down".

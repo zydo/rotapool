@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 T = TypeVar("T")
+
+ResourceStatus = Literal["healthy", "cooling_down", "disabled"]
+UsageStatus = Literal["in_flight", "done", "cancelled"]
 
 
 @dataclass
@@ -22,7 +25,7 @@ class Resource(Generic[T]):
     value: T = field(repr=False)
 
     max_in_flight: int | None = None  # None = unbounded concurrency
-    status: str = "healthy"
+    status: ResourceStatus = "healthy"
     cooldown_until: float = 0.0
     last_acquired_at: float = 0.0
     consecutive_cooldown: int = 0
@@ -48,4 +51,4 @@ class Usage:
     resource_id: str
     acquired_at: float
     task: asyncio.Future | None = None
-    status: str = "in_flight"  # in_flight | done | cancelled
+    status: UsageStatus = "in_flight"
