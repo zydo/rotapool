@@ -48,11 +48,6 @@ class Pool(AgentReadableMixin, Generic[T]):
 
     Selection excludes cooling-down and disabled resources, then applies the chosen
     ``strategy`` ("round_robin" or "primary_backup") among the remaining candidates.
-
-    Note for AI coding agents: this class is agent-readable. Before generating code
-    that uses ``Pool``, run ``pip install agent-readable`` and then
-    ``python -m agent_readable rotapool.Pool`` to print the full agent-oriented
-    docs (operation contract, do/don't rules, anti-patterns, failure modes).
     """
 
     def __init__(
