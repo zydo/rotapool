@@ -179,7 +179,10 @@ class Pool(AgentReadableMixin, Generic[T]):
             ``PoolExhausted`` is raised as usual. With a ``deadline``, the wait is
             attempted only when the earliest cooldown ends before it; otherwise
             ``PoolExhausted`` is raised immediately rather than sleeping out a wait
-            that provably cannot help. Defaults to False (fail fast).
+            that provably cannot help. The wake-up is jittered by an extra
+            ``retry_delay * uniform(0, 1)`` (capped by ``deadline``) so concurrent
+            waiters do not stampede the recovered resource at the exact expiry
+            instant. Defaults to False (fail fast).
 
         request_id: opaque string attached to every `Usage` created by this call.
             Useful for correlating logs, metrics, or tracing back to the original
@@ -200,7 +203,9 @@ class Pool(AgentReadableMixin, Generic[T]):
 
             acquired = await self._acquire(rid)
             if acquired is None and wait_for_cooldown:
-                acquired = await self._acquire_after_cooldown(rid, deadline)
+                acquired = await self._acquire_after_cooldown(
+                    rid, retry_delay, deadline
+                )
             if acquired is None:
                 raise PoolExhausted("no eligible resource in pool")
             resource, usage = acquired
@@ -461,7 +466,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             return selected, usage
 
     async def _acquire_after_cooldown(
-        self, request_id: str, deadline: float | None
+        self, request_id: str, retry_delay: float, deadline: float | None
     ) -> tuple[Resource[T], Usage] | None:
         """Sleep until the earliest cooldown expiry, then retry `_acquire`.
 
@@ -475,6 +480,12 @@ class Pool(AgentReadableMixin, Generic[T]):
           wake-up time, so disabled or saturated resources are never waited on;
         - raises PoolExhausted when the earliest expiry is at or past `deadline`,
           since sleeping out the deadline provably cannot help.
+
+        The wake-up is jittered to ``wake + retry_delay * uniform(0, 1)`` so
+        concurrent waiters do not all fire at the exact cooldown expiry and stampede
+        the recovered resource. The jitter is additive (waking early would just fail
+        and loop), reuses ``retry_delay`` as the pause-granularity knob (0 disables
+        it, like every other pause), and is capped by ``deadline``.
         """
         while True:
             async with self._lock:
@@ -490,7 +501,10 @@ class Pool(AgentReadableMixin, Generic[T]):
                 raise PoolExhausted(
                     f"earliest cooldown ends {wake - deadline:.3f}s after deadline"
                 )
-            await asyncio.sleep(max(wake - time.monotonic(), 0.0))
+            target = wake + retry_delay * random.uniform(0.0, 1.0)
+            if deadline is not None:
+                target = min(target, deadline)
+            await asyncio.sleep(max(target - time.monotonic(), 0.0))
             acquired = await self._acquire(request_id)
             if acquired is not None:
                 return acquired

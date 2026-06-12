@@ -202,6 +202,8 @@ The pause between attempts is jittered: `retry_delay * uniform(0.5, 1.5)`, mean 
 
 By default, `run()` fails fast: when no resource is eligible at the start of an attempt, it raises `PoolExhausted` immediately — even if a `deadline` would outlive the cooldowns. Pass `wait_for_cooldown=True` to instead sleep until the earliest `cooldown_until` among cooling resources and select again. Only a cooldown gives a known wake-up time, so this never waits on resources that are disabled or at `max_in_flight` — if nothing is cooling, `PoolExhausted` raises as usual. With a `deadline`, the wait only happens when the earliest cooldown ends before it; otherwise `PoolExhausted` raises immediately rather than sleeping out a wait that provably cannot help.
 
+The wake-up is jittered too: each waiter sleeps an extra `retry_delay * uniform(0, 1)` past the expiry (capped by `deadline`), so concurrent waiters don't all fire at the recovered resource in the same instant. As with the retry pause, `retry_delay=0` disables the jitter.
+
 ### Admin control
 
 `pool.enable(resource_id)` and `pool.disable(resource_id)` give operators write access to resource lifecycle state — the counterpart to `snapshot()`:
@@ -283,7 +285,9 @@ await pool.run(
     #                  and select again, instead of raising PoolExhausted immediately.
     #                  Never waits on disabled or saturated resources (no known wake-up
     #                  time); raises immediately when the earliest cooldown ends at or
-    #                  after the deadline. False = fail fast (default).
+    #                  after the deadline. The wake-up is jittered by an extra
+    #                  retry_delay * uniform(0, 1), capped by the deadline, to avoid
+    #                  waiter stampedes at the expiry instant. False = fail fast (default).
 
     request_id: str | None = None,
     # request_id:      Opaque string attached to every Usage created by this call.

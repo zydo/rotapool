@@ -1210,7 +1210,7 @@ class TestWaitForCooldown:
 
         start = time.monotonic()
         result = await pool.run(
-            ops.identity(), wait_for_cooldown=True, deadline=start + 5.0
+            ops.identity(), wait_for_cooldown=True, deadline=start + 5.0, retry_delay=0
         )
         assert result == "v0"
         assert time.monotonic() - start >= 0.05
@@ -1263,7 +1263,9 @@ class TestWaitForCooldown:
             await pool.run(ops.raising(lambda: CooldownResource(cooldown_seconds=0.05)))
 
         start = time.monotonic()
-        waiter = asyncio.create_task(pool.run(ops.identity(), wait_for_cooldown=True))
+        waiter = asyncio.create_task(
+            pool.run(ops.identity(), wait_for_cooldown=True, retry_delay=0)
+        )
         await asyncio.sleep(0.02)
         # While the waiter sleeps toward start+~0.05, the older usage fails and
         # extends the cooldown to ~start+0.17.
@@ -1273,6 +1275,34 @@ class TestWaitForCooldown:
             await older
         assert await waiter == "v0"
         assert time.monotonic() - start >= 0.12
+
+    async def test_i5_wake_is_jittered(
+        self, ops: Ops, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The waiter's wake-up is jittered to wake + retry_delay * uniform(0, 1),
+        so concurrent waiters don't stampede the resource at the exact expiry."""
+        import random
+
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        uniform_args: list[tuple[float, float]] = []
+
+        def fake_uniform(a: float, b: float) -> float:
+            uniform_args.append((a, b))
+            return 1.0
+
+        monkeypatch.setattr(random, "uniform", fake_uniform)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(lambda: CooldownResource(cooldown_seconds=0.05)))
+
+        start = time.monotonic()
+        assert (
+            await pool.run(ops.identity(), wait_for_cooldown=True, retry_delay=0.2)
+            == "v0"
+        )
+        # Full jitter (uniform -> 1.0): slept past the ~0.05s expiry by ~0.2s more.
+        assert uniform_args == [(0.0, 1.0)]
+        assert time.monotonic() - start >= 0.2
 
 
 # ===================================================================
