@@ -381,7 +381,8 @@ resource = Resource(
 ```python
 raise CooldownResource(
     cooldown_seconds: float | None = None,
-    # Explicit cooldown duration (e.g. from Retry-After header).
+    # Explicit cooldown duration (e.g. from Retry-After header). Must be >= 0
+    # (negative and NaN raise ValueError at construction).
     # None = use the pool's cooldown_table based on consecutive_cooldown count.
 
     reason: str | None = None,

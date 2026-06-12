@@ -1182,6 +1182,16 @@ class TestAPI:
         Resource(resource_id="r0", value="v", max_in_flight=None)
         Resource(resource_id="r0", value="v", max_in_flight=1)
 
+    def test_h19_cooldown_resource_rejects_bad_seconds(self) -> None:
+        """Negative or NaN cooldown_seconds → ValueError at construction. NaN would
+        otherwise poison cooldown_until and leave the resource cooling forever."""
+        with pytest.raises(ValueError, match="cooldown_seconds must be >= 0 or None"):
+            CooldownResource(cooldown_seconds=-5.0)
+        with pytest.raises(ValueError, match="cooldown_seconds must be >= 0 or None"):
+            CooldownResource(cooldown_seconds=float("nan"))
+        CooldownResource(cooldown_seconds=0.0)
+        CooldownResource(cooldown_seconds=None)
+
 
 # ===================================================================
 # Group I — Opt-in wait for cooldown

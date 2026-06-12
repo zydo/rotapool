@@ -5,14 +5,21 @@ class CooldownResource(Exception):
     """Raise from a user operation to mark the resource as cooling_down.
 
     cooldown_seconds: explicit cooldown duration (e.g. derived from a Retry-After
-        header). If None, the framework's default cooldown table applies based on
-        consecutive_cooldown count.
+        header). Must be >= 0. If None, the framework's default cooldown table
+        applies based on consecutive_cooldown count.
     reason: free-form string surfaced in logs and metrics.
     """
 
     def __init__(
         self, cooldown_seconds: float | None = None, reason: str | None = None
     ) -> None:
+        # `not >= 0` instead of `< 0`: also rejects NaN, which would otherwise
+        # poison cooldown_until and leave the resource cooling forever (NaN
+        # comparisons are always false, so the expiry check never passes).
+        if cooldown_seconds is not None and not cooldown_seconds >= 0:
+            raise ValueError(
+                f"cooldown_seconds must be >= 0 or None, got {cooldown_seconds!r}"
+            )
         super().__init__(reason or "resource cooldown")
         self.cooldown_seconds = cooldown_seconds
         self.reason = reason
