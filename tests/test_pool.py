@@ -1181,3 +1181,85 @@ class TestAPI:
             Resource(resource_id="r0", value="v", max_in_flight=0)
         Resource(resource_id="r0", value="v", max_in_flight=None)
         Resource(resource_id="r0", value="v", max_in_flight=1)
+
+
+# ===================================================================
+# Group I — Opt-in wait for cooldown
+# ===================================================================
+
+
+class TestWaitForCooldown:
+    async def test_i1_waits_out_cooldown_and_succeeds(self, ops: Ops) -> None:
+        """All resources cooling + wait_for_cooldown=True → run() sleeps until the
+        cooldown expires and succeeds instead of raising PoolExhausted. The deadline
+        comfortably outlives the cooldown (the headline use case)."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(lambda: CooldownResource(cooldown_seconds=0.08)))
+
+        start = time.monotonic()
+        result = await pool.run(
+            ops.identity(), wait_for_cooldown=True, deadline=start + 5.0
+        )
+        assert result == "v0"
+        assert time.monotonic() - start >= 0.05
+
+    async def test_i2_nothing_cooling_raises_immediately(self, ops: Ops) -> None:
+        """Only a cooldown gives a known wake-up time: with every resource disabled
+        there is nothing to wait on, so PoolExhausted raises at once."""
+        pool = Pool(resources=_res(2), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(DisableResource), retry_delay=0)
+
+        start = time.monotonic()
+        with pytest.raises(PoolExhausted, match="no eligible resource"):
+            await pool.run(ops.identity(), wait_for_cooldown=True)
+        assert time.monotonic() - start < 0.05
+
+    async def test_i3_cooldown_past_deadline_raises_immediately(self, ops: Ops) -> None:
+        """Earliest cooldown expiry at/after the deadline → raise right away with a
+        specific message instead of sleeping out a wait that provably cannot help."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(lambda: CooldownResource(cooldown_seconds=5.0)))
+
+        start = time.monotonic()
+        with pytest.raises(PoolExhausted, match="cooldown ends .* after deadline"):
+            await pool.run(
+                ops.identity(), wait_for_cooldown=True, deadline=start + 0.05
+            )
+        assert time.monotonic() - start < 0.05
+
+    async def test_i4_recomputes_wake_when_cooldown_extends(self, ops: Ops) -> None:
+        """A failure that lands while the waiter sleeps pushes cooldown_until out;
+        on wake the waiter finds the resource still cooling and sleeps again toward
+        the new expiry instead of giving up."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        release = asyncio.Event()
+
+        async def slow_cooldown_body(_: Resource[str]) -> None:
+            await release.wait()
+            raise CooldownResource(cooldown_seconds=0.15)
+
+        older = asyncio.create_task(pool.run(ops.op(slow_cooldown_body)))
+        await asyncio.sleep(0.02)
+
+        # A younger usage cools the resource for 0.05s; the older one, being older,
+        # is not cancelled and keeps running.
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(lambda: CooldownResource(cooldown_seconds=0.05)))
+
+        start = time.monotonic()
+        waiter = asyncio.create_task(pool.run(ops.identity(), wait_for_cooldown=True))
+        await asyncio.sleep(0.02)
+        # While the waiter sleeps toward start+~0.05, the older usage fails and
+        # extends the cooldown to ~start+0.17.
+        release.set()
+
+        with pytest.raises(PoolExhausted):
+            await older
+        assert await waiter == "v0"
+        assert time.monotonic() - start >= 0.12

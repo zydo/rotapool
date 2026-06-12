@@ -134,6 +134,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         max_attempts: int | None = None,
         deadline: float | None = None,
         retry_delay: float = 0.5,
+        wait_for_cooldown: bool = False,
         request_id: str | None = None,
     ) -> R:
         """Drive the retry loop for one logical request.
@@ -170,6 +171,16 @@ class Pool(AgentReadableMixin, Generic[T]):
             ``retry_delay``) so concurrent callers do not retry in lockstep and
             stampede the next eligible resource.
 
+        wait_for_cooldown: when no resource is eligible at the start of an attempt,
+            sleep until the earliest ``cooldown_until`` among cooling resources and
+            select again, instead of raising ``PoolExhausted`` immediately. Only a
+            cooldown gives a known wake-up time, so this never waits on resources
+            that are disabled or at ``max_in_flight`` -- if nothing is cooling,
+            ``PoolExhausted`` is raised as usual. With a ``deadline``, the wait is
+            attempted only when the earliest cooldown ends before it; otherwise
+            ``PoolExhausted`` is raised immediately rather than sleeping out a wait
+            that provably cannot help. Defaults to False (fail fast).
+
         request_id: opaque string attached to every `Usage` created by this call.
             Useful for correlating logs, metrics, or tracing back to the original
             caller (e.g. an HTTP request-id header). Auto-generated UUID when None.
@@ -188,6 +199,8 @@ class Pool(AgentReadableMixin, Generic[T]):
                 raise PoolExhausted(f"deadline exceeded after {attempt_num} attempt(s)")
 
             acquired = await self._acquire(rid)
+            if acquired is None and wait_for_cooldown:
+                acquired = await self._acquire_after_cooldown(rid, deadline)
             if acquired is None:
                 raise PoolExhausted("no eligible resource in pool")
             resource, usage = acquired
@@ -275,6 +288,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         max_attempts: int | None = None,
         deadline: float | None = None,
         retry_delay: float = 0.5,
+        wait_for_cooldown: bool = False,
     ) -> Callable[[Callable[..., Awaitable[R]]], Callable[..., Awaitable[R]]]:
         """Decorator factory: wrap a callable so every call goes through ``self.run()``,
         with resource selection (per pool ``strategy``) and retry handled for you.
@@ -297,6 +311,7 @@ class Pool(AgentReadableMixin, Generic[T]):
                     max_attempts=max_attempts,
                     deadline=deadline,
                     retry_delay=retry_delay,
+                    wait_for_cooldown=wait_for_cooldown,
                 )
 
             return wrapper
@@ -408,6 +423,41 @@ class Pool(AgentReadableMixin, Generic[T]):
                 usage.usage_id
             )
             return selected, usage
+
+    async def _acquire_after_cooldown(
+        self, request_id: str, deadline: float | None
+    ) -> tuple[Resource[T], Usage] | None:
+        """Sleep until the earliest cooldown expiry, then retry `_acquire`.
+
+        Loops because waking up does not guarantee eligibility: the expired resource
+        may have been re-cooled by a concurrent failure (possibly extending its
+        cooldown), or it may sit at `max_in_flight` while another resource is still
+        cooling. Each iteration either acquires, sleeps toward a cooldown expiry, or
+        gives up:
+
+        - returns None when nothing is cooling -- only a cooldown gives a known
+          wake-up time, so disabled or saturated resources are never waited on;
+        - raises PoolExhausted when the earliest expiry is at or past `deadline`,
+          since sleeping out the deadline provably cannot help.
+        """
+        while True:
+            async with self._lock:
+                wakes = [
+                    r.cooldown_until
+                    for r in self._resources.values()
+                    if r.status == "cooling_down"
+                ]
+            if not wakes:
+                return None
+            wake = min(wakes)
+            if deadline is not None and wake >= deadline:
+                raise PoolExhausted(
+                    f"earliest cooldown ends {wake - deadline:.3f}s after deadline"
+                )
+            await asyncio.sleep(max(wake - time.monotonic(), 0.0))
+            acquired = await self._acquire(request_id)
+            if acquired is not None:
+                return acquired
 
     async def _on_ok(self, usage: Usage) -> None:
         """Resource is operational. Reset cooldown state.
