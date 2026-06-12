@@ -43,7 +43,7 @@ from rotapool import CooldownResource, DisableResource, Pool, Resource
 
 # Define your resources (e.g. API keys)
 pool = Pool(
-    # A list or dict of Resource objects. Dict keys are used as resource IDs.
+    # A list of Resource objects, or a dict whose keys match each resource_id.
     resources=[
         Resource(
             resource_id="key-1",                 # Unique identifier (used in logs, metrics, snapshot)
@@ -64,9 +64,10 @@ pool = Pool(
 # Resource selection happens automatically per the pool's strategy (round_robin by default).
 # All parameters are optional and forward to pool.run() on every call.
 @pool.use(
-    max_attempts=None,       # Override the pool's max_attempts for this decorated function
-    deadline=None,           # Absolute time.monotonic() deadline; None = no deadline
-    retry_delay=0.5,         # Base pause between failed attempts (jittered ±50%)
+    max_attempts=None,         # Override the pool's max_attempts for this decorated function
+    deadline=None,             # Absolute time.monotonic() deadline; None = no deadline
+    retry_delay=0.5,           # Base pause between failed attempts (jittered ±50%)
+    wait_for_cooldown=False,   # Wait out the earliest cooldown instead of failing fast
 )
 async def call_upstream(resource, url, payload):
     async with httpx.AsyncClient() as client:
@@ -93,7 +94,7 @@ result = await call_upstream("https://api.example.com/v1/chat", {"prompt": "hi"}
 
 ### Option 2: Direct `run()`
 
-`@pool.use()` is a thin shim over `pool.run()`, but it only accepts the policy knobs that are safe to fix at decoration time (`max_attempts`, `deadline`, `retry_delay`). Anything that needs to vary **per call** must go through `run()` directly — most notably `request_id`, which is meant to correlate with caller-side context (e.g. an inbound HTTP request id) and would be wrong to bake into the decorator. Use `run()` directly when you want per-call overrides or when the call site can't be decorated:
+`@pool.use()` is a thin shim over `pool.run()`, but it only accepts the policy knobs that are safe to fix at decoration time (`max_attempts`, `deadline`, `retry_delay`, `wait_for_cooldown`). Anything that needs to vary **per call** must go through `run()` directly — most notably `request_id`, which is meant to correlate with caller-side context (e.g. an inbound HTTP request id) and would be wrong to bake into the decorator. Use `run()` directly when you want per-call overrides or when the call site can't be decorated:
 
 ```python
 async def call_upstream(resource, url, payload):
@@ -117,6 +118,7 @@ result = await pool.run(
     max_attempts=None,               # Override the pool's max_attempts for this call only
     deadline=time.monotonic() + 30,  # Gates the start of each attempt (not in-flight work); None = no deadline
     retry_delay=0.5,                 # Base pause between failed attempts (jittered ±50%)
+    wait_for_cooldown=False,         # Wait out the earliest cooldown instead of failing fast
     request_id="req-abc",            # Opaque string attached to every Usage; auto-UUID when None
 )
 ```
@@ -198,6 +200,17 @@ Cancellation is **best-effort**: it works when the operation returns a coroutine
 
 The pause between attempts is jittered: `retry_delay * uniform(0.5, 1.5)`, mean `retry_delay`. Without jitter, concurrent calls that hit the same cooldown would all wake at the same instant and stampede the next eligible resource.
 
+By default, `run()` fails fast: when no resource is eligible at the start of an attempt, it raises `PoolExhausted` immediately — even if a `deadline` would outlive the cooldowns. Pass `wait_for_cooldown=True` to instead sleep until the earliest `cooldown_until` among cooling resources and select again. Only a cooldown gives a known wake-up time, so this never waits on resources that are disabled or at `max_in_flight` — if nothing is cooling, `PoolExhausted` raises as usual. With a `deadline`, the wait only happens when the earliest cooldown ends before it; otherwise `PoolExhausted` raises immediately rather than sleeping out a wait that provably cannot help.
+
+### Admin control
+
+`pool.enable(resource_id)` and `pool.disable(resource_id)` give operators write access to resource lifecycle state — the counterpart to `snapshot()`:
+
+- **`disable()`** removes a resource from selection until `enable()` is called. Unlike an operation raising `DisableResource`, in-flight usages are **not** cancelled — admin disable is policy, not failure evidence, so running work (which may already have upstream side effects) finishes naturally.
+- **`enable()`** returns a resource to selection: it clears both the disabled state and any active cooldown, and resets `consecutive_cooldown` to 0 — enable means "the operator says this resource is usable now" (e.g. a rotated key), so if the operator is wrong, escalation restarts from the first `cooldown_table` slot rather than resuming where it left off.
+
+Both are async (they take the pool lock), idempotent, and raise `KeyError` for an unknown `resource_id`.
+
 ### Cancellation discrimination
 
 The framework distinguishes external cancellation (client disconnect, shutdown — re-raised) from internal cancellation (resource failure — swallowed and retried) by checking `usage.status`. The cooldown/disable handler sets the status to `"cancelled"` under the pool lock *before* invoking `.cancel()` on the handle, so observing that status when `CancelledError` arrives reliably means "we cancelled ourselves." Works on any Python 3.10+.
@@ -210,7 +223,8 @@ The framework distinguishes external cancellation (client disconnect, shutdown �
 pool = Pool(
     resources: list[Resource[T]] | dict[str, Resource[T]],
     # resources:       A list of Resource objects, or a dict mapping resource_id -> Resource.
-    #                  Duplicate resource_ids in list form raise ValueError.
+    #                  Duplicate resource_ids in list form raise ValueError, as does a
+    #                  dict key that does not match its Resource's resource_id.
 
     max_attempts: int = 3,
     # max_attempts:    Total retry budget per run() call. Each attempt picks among
@@ -263,6 +277,14 @@ await pool.run(
     #                  (mean stays retry_delay) so concurrent callers don't retry in
     #                  lockstep and stampede the next eligible resource.
 
+    wait_for_cooldown: bool = False,
+    # wait_for_cooldown: When no resource is eligible at the start of an attempt,
+    #                  sleep until the earliest cooldown_until among cooling resources
+    #                  and select again, instead of raising PoolExhausted immediately.
+    #                  Never waits on disabled or saturated resources (no known wake-up
+    #                  time); raises immediately when the earliest cooldown ends at or
+    #                  after the deadline. False = fail fast (default).
+
     request_id: str | None = None,
     # request_id:      Opaque string attached to every Usage created by this call.
     #                  Auto-generated UUID when None.
@@ -274,6 +296,7 @@ await pool.run(
     max_attempts: int | None = None,     # Per-call override; None = use pool default
     deadline: float | None = None,       # Absolute time.monotonic() deadline
     retry_delay: float = 0.5,            # Base pause between failed attempts (jittered ±50%)
+    wait_for_cooldown: bool = False,     # Wait out the earliest cooldown instead of failing fast
 )
 # Returns a decorator. The decorated function receives a Resource[T] as its
 # first positional argument (injected by the wrapper), followed by caller args.
@@ -298,6 +321,20 @@ pool.snapshot() -> dict[str, dict[str, Any]]
 #     },
 #     ...
 # }
+```
+
+```python
+await pool.enable(resource_id: str) -> None
+# Administratively return a resource to selection. Clears both the disabled state
+# and any active cooldown, and resets consecutive_cooldown to 0 (a later failure
+# escalates from the first cooldown_table slot). Idempotent on a healthy resource.
+# Raises KeyError for an unknown resource_id.
+
+await pool.disable(resource_id: str) -> None
+# Administratively remove a resource from selection until enable(). In-flight
+# usages are NOT cancelled (unlike an operation raising DisableResource) — they
+# run to natural completion. Idempotent on an already-disabled resource.
+# Raises KeyError for an unknown resource_id.
 ```
 
 ### `rotapool.Resource[T]`
@@ -338,7 +375,7 @@ resource = Resource(
 | Exception          | Who raises it  | Meaning                                                        |
 | ------------------ | -------------- | -------------------------------------------------------------- |
 | `CooldownResource` | Your operation | Resource temporarily over capacity                             |
-| `DisableResource`  | Your operation | Resource permanently bad                                       |
+| `DisableResource`  | Your operation | Resource permanently bad (only `pool.enable()` brings it back) |
 | `PoolExhausted`    | Framework      | No eligible resource, max attempts reached, or deadline passed |
 
 ```python
@@ -441,7 +478,7 @@ Return only plain values (bytes, dict, dataclass) from operations. For N backend
 
 - **Don't raise `CooldownResource` for business errors** (404, validation failures). The next resource will return the same error and burn the retry budget for nothing — these belong in normal exceptions or return values.
 - **Don't catch and swallow exceptions inside the operation.** The pool needs to see `CooldownResource` / `DisableResource` to update health; swallowing them turns rate limits into invisible successes.
-- **Don't mutate `Resource` fields from outside the pool.** `status`, `cooldown_until`, `last_acquired_at`, and `consecutive_cooldown` are framework-owned lifecycle state.
+- **Don't mutate `Resource` fields from outside the pool.** `status`, `cooldown_until`, `last_acquired_at`, and `consecutive_cooldown` are framework-owned lifecycle state. For administrative control, use `await pool.enable(id)` / `await pool.disable(id)` instead.
 - **Don't share one `Pool` across asyncio event loops.** The internal lock binds to the loop where it was first awaited; reusing the pool from a different loop is undefined behaviour.
 
 ### Gotcha: cancellation only hits younger siblings

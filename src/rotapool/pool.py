@@ -680,6 +680,16 @@ pool = Pool(
 )
 ```
 
+### Exhaustion: fail fast vs wait
+
+When no resource is eligible, ``run()`` raises ``PoolExhausted`` immediately --
+even if a ``deadline`` would outlive the cooldowns. Pass ``wait_for_cooldown=True``
+(on ``run()`` or ``use()``) to instead sleep until the earliest cooldown expiry
+and select again -- useful for batch jobs that prefer waiting over failing. It
+never waits on disabled or saturated resources (no known wake-up time), and with
+a ``deadline`` it raises immediately when the earliest expiry lands at or after
+it, rather than sleeping out a wait that cannot help.
+
 ### Anti-pattern: doing the real work OUTSIDE ``run()``
 
 The pool only sees what happens INSIDE the operation. Returning a client /

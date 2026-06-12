@@ -29,8 +29,10 @@ class DisableResource(Exception):
 class PoolExhausted(Exception):
     """Raised by the framework when the pool cannot satisfy a request.
 
-    Covers three scenarios:
+    Covers four scenarios:
     - No eligible resource exists (all disabled, cooling down, or at capacity).
     - Max retry attempts exhausted.
     - Deadline exceeded.
+    - With ``wait_for_cooldown=True``: the earliest cooldown expiry lands at or
+      after the deadline, so waiting provably cannot help.
     """
