@@ -1263,3 +1263,92 @@ class TestWaitForCooldown:
             await older
         assert await waiter == "v0"
         assert time.monotonic() - start >= 0.12
+
+
+# ===================================================================
+# Group J — Admin enable / disable
+# ===================================================================
+
+
+class TestAdminEnableDisable:
+    async def test_j1_disable_removes_from_selection(self, ops: Ops) -> None:
+        """An admin-disabled resource is never selected until re-enabled."""
+        pool = Pool(resources=_res(2), cooldown_table=FAST_TABLE)
+        await pool.disable("r1")
+
+        assert pool.snapshot()["r1"]["status"] == "disabled"
+        for _ in range(4):
+            assert await pool.run(ops.identity()) == "v0"
+
+    async def test_j2_enable_restores_disabled_resource(self, ops: Ops) -> None:
+        """enable() reverses both DisableResource and admin disable()."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(DisableResource))
+        with pytest.raises(PoolExhausted, match="no eligible resource"):
+            await pool.run(ops.identity())
+
+        await pool.enable("r0")
+        assert await pool.run(ops.identity()) == "v0"
+        assert pool.snapshot()["r0"]["status"] == "healthy"
+
+    async def test_j3_enable_clears_cooldown_and_resets_counter(self, ops: Ops) -> None:
+        """enable() on a cooling resource makes it eligible immediately and resets
+        consecutive_cooldown, so the next failure escalates from the first table
+        slot instead of resuming where it left off."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        cooler = ops.raising(lambda: CooldownResource(reason="busy"))
+
+        # Walk the escalation to counter=2 (second table slot, 0.10s).
+        with pytest.raises(PoolExhausted):
+            await pool.run(cooler)
+        await asyncio.sleep(FAST_TABLE[0] + 0.02)
+        with pytest.raises(PoolExhausted):
+            await pool.run(cooler)
+        assert pool.snapshot()["r0"]["consecutive_cooldown"] == 2
+
+        await pool.enable("r0")
+        snap = pool.snapshot()["r0"]
+        assert snap["status"] == "healthy"
+        assert snap["consecutive_cooldown"] == 0
+
+        # Eligible immediately -- no waiting out the ~0.10s that remained.
+        start = time.monotonic()
+        assert await pool.run(ops.identity()) == "v0"
+        assert time.monotonic() - start < 0.05
+
+        # Fresh escalation: next cooldown lands on the first table slot.
+        with pytest.raises(PoolExhausted):
+            await pool.run(cooler)
+        snap = pool.snapshot()["r0"]
+        assert snap["consecutive_cooldown"] == 1
+        assert snap["cooldown_seconds_remaining"] <= FAST_TABLE[0]
+
+    async def test_j4_disable_lets_inflight_finish(self, ops: Ops) -> None:
+        """Admin disable() is policy, not failure evidence: in-flight usages are
+        not cancelled and run to natural completion."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        release = asyncio.Event()
+
+        async def body(r: Resource[str]) -> str:
+            await release.wait()
+            return r.value
+
+        inflight = asyncio.create_task(pool.run(ops.op(body)))
+        await asyncio.sleep(0.02)
+
+        await pool.disable("r0")
+        with pytest.raises(PoolExhausted, match="no eligible resource"):
+            await pool.run(ops.identity())
+
+        release.set()
+        assert await inflight == "v0"
+
+    async def test_j5_unknown_resource_id_raises_keyerror(self) -> None:
+        """enable()/disable() on an id the pool does not manage → KeyError."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        with pytest.raises(KeyError, match="unknown resource_id"):
+            await pool.enable("nope")
+        with pytest.raises(KeyError, match="unknown resource_id"):
+            await pool.disable("nope")

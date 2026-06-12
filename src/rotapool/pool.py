@@ -347,6 +347,42 @@ class Pool(AgentReadableMixin, Generic[T]):
             }
         return result
 
+    async def enable(self, resource_id: str) -> None:
+        """Administratively return a resource to selection.
+
+        Clears both the disabled state and any active cooldown -- enable means "the
+        operator says this resource is usable now" (e.g. a rotated key). Also resets
+        ``consecutive_cooldown`` to 0, so if the operator is wrong the escalation
+        restarts from the first ``cooldown_table`` slot instead of resuming where it
+        left off. Idempotent on an already-healthy resource.
+
+        Raises KeyError for an unknown resource_id.
+        """
+        async with self._lock:
+            resource = self._get_resource(resource_id)
+            resource.status = "healthy"
+            resource.cooldown_until = 0.0
+            resource.consecutive_cooldown = 0
+
+    async def disable(self, resource_id: str) -> None:
+        """Administratively remove a resource from selection until ``enable()``.
+
+        Unlike an operation raising ``DisableResource``, in-flight usages on the
+        resource are NOT cancelled: admin disable is policy, not failure evidence,
+        so running work (which may already have upstream side effects) finishes
+        naturally. Idempotent on an already-disabled resource.
+
+        Raises KeyError for an unknown resource_id.
+        """
+        async with self._lock:
+            self._get_resource(resource_id).status = "disabled"
+
+    def _get_resource(self, resource_id: str) -> Resource[T]:
+        resource = self._resources.get(resource_id)
+        if resource is None:
+            raise KeyError(f"unknown resource_id: {resource_id!r}")
+        return resource
+
     @staticmethod
     def _build_resources(
         resources: list[Resource[T]] | dict[str, Resource[T]],
@@ -678,7 +714,10 @@ N ``run()`` invocations.
   next resource returns the same error and burns the budget for nothing.
 - Catch and swallow exceptions inside the operation -- the pool needs to see
   them to decide resource health.
-- Mutate ``Resource`` fields from outside; the pool owns lifecycle state.
+- Mutate ``Resource`` fields from outside; the pool owns lifecycle state. For
+  administrative control use ``await pool.enable(id)`` / ``await pool.disable(id)``
+  (enable also clears any cooldown and resets the escalation counter; disable
+  never cancels in-flight work).
 - Share one ``Pool`` across asyncio event loops -- the lock binds to the loop
   where it was first awaited.
 
