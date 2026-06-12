@@ -494,6 +494,8 @@ When a resource raises `CooldownResource` or `DisableResource`, the framework ca
 
 `asyncio.CancelledError` from this sibling cancellation is swallowed by the framework and the affected usages retry on a fresh resource; only **outer caller cancellation** propagates back to the caller.
 
+One known edge: if an outer cancellation lands in the same event-loop tick as an internal sibling cancellation, only one `CancelledError` is delivered and it is classified as internal — the external cancel is absorbed for that attempt and `run()` retries. This is a deliberate trade-off for Python 3.10 compatibility (3.11+ `Task.cancelling()` could disambiguate). The window is a single tick; a caller that must stop can simply cancel again.
+
 ## Testing
 
 ```bash

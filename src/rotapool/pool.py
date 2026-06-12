@@ -267,7 +267,10 @@ class Pool(AgentReadableMixin, Generic[T]):
                 # resource cancelled us. With no cancel handle (usage.task is None) the
                 # pool could not have delivered this error even if a sibling marked the
                 # usage cancelled, so it must be external. Works on any Python 3.10+
-                # (no asyncio.Task.cancelling() dependency). Cleanup runs in finally.
+                # (no asyncio.Task.cancelling() dependency); the trade-off is that an
+                # external cancel landing in the same tick as an internal one is
+                # classified internal and absorbed for that attempt -- 3.11+
+                # Task.cancelling() could disambiguate. Cleanup runs in finally.
                 cancelled_internally = (
                     usage.status == "cancelled" and usage.task is not None
                 )
@@ -775,5 +778,7 @@ Cooldown/disable cancels YOUNGER in-flight usages on the same resource and
 retries them elsewhere; OLDER usages run to completion (they may already
 have side effects upstream). ``asyncio.CancelledError`` from sibling
 cancellation is swallowed and retried; only OUTER caller cancellation
-propagates.
+propagates. Rare edge: an outer cancel landing in the same event-loop
+tick as an internal sibling cancel is classified internal and absorbed
+for that attempt (3.10-compat trade-off) -- cancel again to stop.
 """
