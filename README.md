@@ -204,6 +204,8 @@ By default, `run()` fails fast: when no resource is eligible at the start of an 
 
 The wake-up is jittered too: each waiter sleeps an extra `retry_delay * uniform(0, 1)` past the expiry (capped by `deadline`), so concurrent waiters don't all fire at the recovered resource in the same instant. As with the retry pause, `retry_delay=0` disables the jitter.
 
+Waiters also react to admin calls: `pool.enable()` wakes them so they can acquire the now-eligible resource immediately, and `pool.disable()` wakes them so they can re-evaluate (and fail fast) instead of sleeping out a cooldown that no longer matters.
+
 ### Admin control
 
 `pool.enable(resource_id)` and `pool.disable(resource_id)` give operators write access to resource lifecycle state — the counterpart to `snapshot()`:
@@ -211,7 +213,7 @@ The wake-up is jittered too: each waiter sleeps an extra `retry_delay * uniform(
 - **`disable()`** removes a resource from selection until `enable()` is called. Unlike an operation raising `DisableResource`, in-flight usages are **not** cancelled — admin disable is policy, not failure evidence, so running work (which may already have upstream side effects) finishes naturally.
 - **`enable()`** returns a resource to selection: it clears both the disabled state and any active cooldown, and resets `consecutive_cooldown` to 0 — enable means "the operator says this resource is usable now" (e.g. a rotated key), so if the operator is wrong, escalation restarts from the first `cooldown_table` slot rather than resuming where it left off.
 
-Both are async (they take the pool lock), idempotent, and raise `KeyError` for an unknown `resource_id`.
+Both are async (they take the pool lock), idempotent, raise `KeyError` for an unknown `resource_id`, and wake any `run(wait_for_cooldown=True)` sleepers so they re-evaluate immediately.
 
 ### Cancellation discrimination
 

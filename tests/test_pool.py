@@ -1304,6 +1304,44 @@ class TestWaitForCooldown:
         assert uniform_args == [(0.0, 1.0)]
         assert time.monotonic() - start >= 0.2
 
+    async def test_i6_admin_enable_wakes_waiter(self, ops: Ops) -> None:
+        """enable() interrupts a wait_for_cooldown sleep: the waiter acquires the
+        re-enabled resource immediately instead of sleeping out the old cooldown."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(lambda: CooldownResource(cooldown_seconds=5.0)))
+
+        start = time.monotonic()
+        waiter = asyncio.create_task(
+            pool.run(ops.identity(), wait_for_cooldown=True, retry_delay=0)
+        )
+        await asyncio.sleep(0.03)
+        await pool.enable("r0")
+
+        assert await waiter == "v0"
+        assert time.monotonic() - start < 1.0
+
+    async def test_i7_admin_disable_wakes_waiter(self, ops: Ops) -> None:
+        """disable() interrupts a wait_for_cooldown sleep: with nothing cooling left
+        the waiter fails fast instead of sleeping out a cooldown that no longer
+        matters."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(lambda: CooldownResource(cooldown_seconds=5.0)))
+
+        start = time.monotonic()
+        waiter = asyncio.create_task(
+            pool.run(ops.identity(), wait_for_cooldown=True, retry_delay=0)
+        )
+        await asyncio.sleep(0.03)
+        await pool.disable("r0")
+
+        with pytest.raises(PoolExhausted, match="no eligible resource"):
+            await waiter
+        assert time.monotonic() - start < 1.0
+
 
 # ===================================================================
 # Group J — Admin enable / disable

@@ -121,6 +121,12 @@ class Pool(AgentReadableMixin, Generic[T]):
         # Guards all possibly racing states.
         self._lock: asyncio.Lock = asyncio.Lock()
 
+        # Wakes wait_for_cooldown sleepers when admin enable()/disable() changes
+        # eligibility, so they re-evaluate instead of sleeping out a stale plan.
+        # Shares self._lock, so holding the lock and holding the condition are
+        # the same thing.
+        self._admin_changed: asyncio.Condition = asyncio.Condition(lock=self._lock)
+
         # usage_id -> Usage
         self._usages: dict[str, Usage] = {}
 
@@ -182,7 +188,8 @@ class Pool(AgentReadableMixin, Generic[T]):
             that provably cannot help. The wake-up is jittered by an extra
             ``retry_delay * uniform(0, 1)`` (capped by ``deadline``) so concurrent
             waiters do not stampede the recovered resource at the exact expiry
-            instant. Defaults to False (fail fast).
+            instant. Admin ``enable()`` / ``disable()`` interrupt the wait so the
+            sleeper re-evaluates immediately. Defaults to False (fail fast).
 
         request_id: opaque string attached to every `Usage` created by this call.
             Useful for correlating logs, metrics, or tracing back to the original
@@ -359,15 +366,17 @@ class Pool(AgentReadableMixin, Generic[T]):
         operator says this resource is usable now" (e.g. a rotated key). Also resets
         ``consecutive_cooldown`` to 0, so if the operator is wrong the escalation
         restarts from the first ``cooldown_table`` slot instead of resuming where it
-        left off. Idempotent on an already-healthy resource.
+        left off. Wakes any ``run(wait_for_cooldown=True)`` sleepers so they can
+        acquire the resource immediately. Idempotent on an already-healthy resource.
 
         Raises KeyError for an unknown resource_id.
         """
-        async with self._lock:
+        async with self._admin_changed:
             resource = self._get_resource(resource_id)
             resource.status = "healthy"
             resource.cooldown_until = 0.0
             resource.consecutive_cooldown = 0
+            self._admin_changed.notify_all()
 
     async def disable(self, resource_id: str) -> None:
         """Administratively remove a resource from selection until ``enable()``.
@@ -375,12 +384,15 @@ class Pool(AgentReadableMixin, Generic[T]):
         Unlike an operation raising ``DisableResource``, in-flight usages on the
         resource are NOT cancelled: admin disable is policy, not failure evidence,
         so running work (which may already have upstream side effects) finishes
-        naturally. Idempotent on an already-disabled resource.
+        naturally. Wakes any ``run(wait_for_cooldown=True)`` sleepers so they can
+        re-evaluate (and fail fast) instead of sleeping out a cooldown that no
+        longer matters. Idempotent on an already-disabled resource.
 
         Raises KeyError for an unknown resource_id.
         """
-        async with self._lock:
+        async with self._admin_changed:
             self._get_resource(resource_id).status = "disabled"
+            self._admin_changed.notify_all()
 
     def _get_resource(self, resource_id: str) -> Resource[T]:
         resource = self._resources.get(resource_id)
@@ -486,25 +498,37 @@ class Pool(AgentReadableMixin, Generic[T]):
         the recovered resource. The jitter is additive (waking early would just fail
         and loop), reuses ``retry_delay`` as the pause-granularity knob (0 disables
         it, like every other pause), and is capped by ``deadline``.
+
+        The sleep is interruptible: admin ``enable()`` / ``disable()`` notify
+        ``self._admin_changed``, so the waiter re-evaluates immediately instead of
+        sleeping out a plan those calls just invalidated. A spurious wake-up (the
+        admin change did not affect this waiter) is harmless -- the loop recomputes.
         """
         while True:
-            async with self._lock:
+            async with self._admin_changed:
                 wakes = [
                     r.cooldown_until
                     for r in self._resources.values()
                     if r.status == "cooling_down"
                 ]
-            if not wakes:
-                return None
-            wake = min(wakes)
-            if deadline is not None and wake >= deadline:
-                raise PoolExhausted(
-                    f"earliest cooldown ends {wake - deadline:.3f}s after deadline"
-                )
-            target = wake + retry_delay * random.uniform(0.0, 1.0)
-            if deadline is not None:
-                target = min(target, deadline)
-            await asyncio.sleep(max(target - time.monotonic(), 0.0))
+                if not wakes:
+                    return None
+                wake = min(wakes)
+                if deadline is not None and wake >= deadline:
+                    raise PoolExhausted(
+                        f"earliest cooldown ends {wake - deadline:.3f}s after deadline"
+                    )
+                target = wake + retry_delay * random.uniform(0.0, 1.0)
+                if deadline is not None:
+                    target = min(target, deadline)
+                try:
+                    # Releases the lock while waiting; reacquires before returning.
+                    await asyncio.wait_for(
+                        self._admin_changed.wait(),
+                        timeout=max(target - time.monotonic(), 0.0),
+                    )
+                except asyncio.TimeoutError:
+                    pass
             acquired = await self._acquire(request_id)
             if acquired is not None:
                 return acquired
