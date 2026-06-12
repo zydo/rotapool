@@ -217,7 +217,7 @@ Both are async (they take the pool lock), idempotent, raise `KeyError` for an un
 
 ### Cancellation discrimination
 
-The framework distinguishes external cancellation (client disconnect, shutdown — re-raised) from internal cancellation (resource failure — swallowed and retried) by checking `usage.status`. The cooldown/disable handler sets the status to `"cancelled"` under the pool lock *before* invoking `.cancel()` on the handle, so observing that status when `CancelledError` arrives reliably means "we cancelled ourselves." Works on any Python 3.10+.
+The framework distinguishes external cancellation (client disconnect, shutdown — re-raised) from internal cancellation (resource failure — swallowed and retried) by checking `usage.status`. The cooldown/disable handler sets the status to `"cancelled"` under the pool lock *before* invoking `.cancel()` on the handle, so observing that status when `CancelledError` arrives means "we cancelled ourselves" — except for the one-tick edge case described in the [cancellation gotcha](#gotcha-cancellation-only-hits-younger-siblings). Works on any Python 3.10+.
 
 ## API reference
 
@@ -378,11 +378,11 @@ resource = Resource(
 
 ### Exceptions
 
-| Exception          | Who raises it  | Meaning                                                        |
-| ------------------ | -------------- | -------------------------------------------------------------- |
-| `CooldownResource` | Your operation | Resource temporarily over capacity                             |
-| `DisableResource`  | Your operation | Resource permanently bad (only `pool.enable()` brings it back) |
-| `PoolExhausted`    | Framework      | No eligible resource, max attempts reached, or deadline passed |
+| Exception          | Who raises it  | Meaning                                                                                                                     |
+| ------------------ | -------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `CooldownResource` | Your operation | Resource temporarily over capacity                                                                                          |
+| `DisableResource`  | Your operation | Resource permanently bad (only `pool.enable()` brings it back)                                                              |
+| `PoolExhausted`    | Framework      | No eligible resource, max attempts reached, deadline passed, or (with `wait_for_cooldown`) waiting cannot beat the deadline |
 
 ```python
 raise CooldownResource(

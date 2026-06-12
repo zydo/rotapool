@@ -165,8 +165,9 @@ class Pool(AgentReadableMixin, Generic[T]):
             Effective value is ``min(max_attempts, len(resources))``.
 
         deadline: absolute time.monotonic() value that gates when each attempt may
-            start. It is checked before every attempt and caps the inter-attempt retry
-            pause, so run() will neither begin new work nor keep sleeping past it. It
+            start. It is checked before every attempt and caps both the inter-attempt
+            retry pause and the opt-in ``wait_for_cooldown`` sleep, so run() will
+            neither begin new work nor keep sleeping past it. It
             does NOT interrupt an operation already in flight -- a single call that runs
             long can overrun the deadline, because the pool never cancels a usage that
             may already have upstream side effects. None disables the deadline.
@@ -729,7 +730,8 @@ even if a ``deadline`` would outlive the cooldowns. Pass ``wait_for_cooldown=Tru
 and select again -- useful for batch jobs that prefer waiting over failing. It
 never waits on disabled or saturated resources (no known wake-up time), and with
 a ``deadline`` it raises immediately when the earliest expiry lands at or after
-it, rather than sleeping out a wait that cannot help.
+it, rather than sleeping out a wait that cannot help. Admin ``enable()`` /
+``disable()`` interrupt the wait so the sleeper re-evaluates immediately.
 
 ### Anti-pattern: doing the real work OUTSIDE ``run()``
 
