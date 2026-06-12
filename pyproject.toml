@@ -30,7 +30,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-agent = ["agent-readable>=0.1.0"]
+agent = ["agent-readable>=0.2.0"]
 
 [project.urls]
 Source = "https://github.com/zydo/rotapool"

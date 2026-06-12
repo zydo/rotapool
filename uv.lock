@@ -4,11 +4,11 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "agent-readable"
-version = "0.1.1"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/6d/e7/df5939402154de2771c40f22d9eb98cb783f3e7a51a706478bd4c56b312d/agent_readable-0.1.1.tar.gz", hash = "sha256:5893ebd2b4d7106f9e2b89152d932c34c7c63e82648238f11443a399bf38905d", size = 40656233, upload-time = "2026-05-11T07:18:52.379Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/42/c6/33108f4418375d796f5b4f409a530f6b0b5561f021ddca7d2c8673814def/agent_readable-0.2.0.tar.gz", hash = "sha256:bf4213278b9eb695e22a3221aede3979306d7d5888be35c0dcbe2c4b931625b3", size = 51151307, upload-time = "2026-06-08T09:39:44.949Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/71/67/84f21d7d2780fb797940e42b63a47356c97a62f1772fe6b837e54ebe83f8/agent_readable-0.1.1-py3-none-any.whl", hash = "sha256:a42ff9773be2ff729a3976e62238f851e29d9de065583d924db1821fdcbc9f4d", size = 13860, upload-time = "2026-05-11T07:18:48.054Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/3e/60dbe3cf7fee01e985a4d5cf5dce58ccd49f0672ec695dfae221ca7844c5/agent_readable-0.2.0-py3-none-any.whl", hash = "sha256:a328a7a498c38b3cc96d31e50d9f2747a2a44730996757cf893b2b149b01d6f5", size = 18717, upload-time = "2026-06-08T09:39:43.259Z" },
 ]
 
 [[package]]
@@ -405,7 +405,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "agent-readable", marker = "extra == 'agent'", specifier = ">=0.1.0" }]
+requires-dist = [{ name = "agent-readable", marker = "extra == 'agent'", specifier = ">=0.2.0" }]
 provides-extras = ["agent"]
 
 [package.metadata.requires-dev]
