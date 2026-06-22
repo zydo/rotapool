@@ -1166,9 +1166,7 @@ class TestAPI:
         assert snap["status"] == "healthy"
         assert snap["cooldown_seconds_remaining"] == 0.0
         # Read-only: the stored status still says cooling_down until next acquire.
-        assert (
-            pool._resources["r0"].status == "cooling_down"
-        )  # pyright: ignore[reportPrivateUsage] # NOSONAR
+        assert pool._resources["r0"].status == "cooling_down"  # pyright: ignore[reportPrivateUsage] # NOSONAR
 
     def test_h16_resource_rejects_empty_resource_id(self) -> None:
         """Empty resource_id → ValueError at Resource construction."""
