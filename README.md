@@ -204,16 +204,17 @@ By default, `run()` fails fast: when no resource is eligible at the start of an 
 
 The wake-up is jittered too: each waiter sleeps an extra `retry_delay * uniform(0, 1)` past the expiry (capped by `deadline`), so concurrent waiters don't all fire at the recovered resource in the same instant. As with the retry pause, `retry_delay=0` disables the jitter.
 
-Waiters also react to admin calls: `pool.enable()` wakes them so they can acquire the now-eligible resource immediately, and `pool.disable()` wakes them so they can re-evaluate (and fail fast) instead of sleeping out a cooldown that no longer matters.
+Waiters also react to admin calls: `pool.add()` wakes them so they can acquire newly added capacity immediately, `pool.enable()` wakes them so they can acquire the now-eligible resource immediately, and `pool.disable()` wakes them so they can re-evaluate (and fail fast) instead of sleeping out a cooldown that no longer matters.
 
 ### Admin control
 
-`pool.enable(resource_id)` and `pool.disable(resource_id)` give operators write access to resource lifecycle state — the counterpart to `snapshot()`:
+`pool.add(resource_id, value, max_in_flight=None)`, `pool.enable(resource_id)`, and `pool.disable(resource_id)` give operators write access to resource lifecycle state — the counterpart to `snapshot()`:
 
+- **`add()`** adds new capacity at runtime. You pass only `resource_id`, `value`, and optional `max_in_flight`; the pool constructs a fresh healthy `Resource` with no cooldown history. Duplicate `resource_id`s raise `ValueError`. Added resources append to pool order, so under `primary_backup` they are the lowest-priority fallback until earlier resources become unavailable.
 - **`disable()`** removes a resource from selection until `enable()` is called. Unlike an operation raising `DisableResource`, in-flight usages are **not** cancelled — admin disable is policy, not failure evidence, so running work (which may already have upstream side effects) finishes naturally.
 - **`enable()`** returns a resource to selection: it clears both the disabled state and any active cooldown, and resets `consecutive_cooldown` to 0 — enable means "the operator says this resource is usable now" (e.g. a rotated key), so if the operator is wrong, escalation restarts from the first `cooldown_table` slot rather than resuming where it left off.
 
-Both are async (they take the pool lock), idempotent, raise `KeyError` for an unknown `resource_id`, and wake any `run(wait_for_cooldown=True)` sleepers so they re-evaluate immediately.
+All three are async (they take the pool lock). `enable()` / `disable()` are idempotent, raise `KeyError` for an unknown `resource_id`, and wake any `run(wait_for_cooldown=True)` sleepers so they re-evaluate immediately. `add()` also wakes those sleepers because a new healthy resource may satisfy them immediately.
 
 ### Cancellation discrimination
 
@@ -330,6 +331,18 @@ pool.snapshot() -> dict[str, dict[str, Any]]
 ```
 
 ```python
+await pool.add(
+    resource_id: str,
+    value: T,
+    *,
+    max_in_flight: int | None = None,
+) -> Resource[T]
+# Add a new healthy resource at runtime. The pool constructs the Resource using
+# lifecycle defaults: status="healthy", cooldown_until=0.0, last_acquired_at=0.0,
+# consecutive_cooldown=0. Duplicate resource_id raises ValueError. The new
+# resource is appended to pool order, so under "primary_backup" it is lower
+# priority than existing resources.
+
 await pool.enable(resource_id: str) -> None
 # Administratively return a resource to selection. Clears both the disabled state
 # and any active cooldown, and resets consecutive_cooldown to 0 (a later failure
@@ -485,7 +498,7 @@ Return only plain values (bytes, dict, dataclass) from operations. For N backend
 
 - **Don't raise `CooldownResource` for business errors** (404, validation failures). The next resource will return the same error and burn the retry budget for nothing — these belong in normal exceptions or return values.
 - **Don't catch and swallow exceptions inside the operation.** The pool needs to see `CooldownResource` / `DisableResource` to update health; swallowing them turns rate limits into invisible successes.
-- **Don't mutate `Resource` fields from outside the pool.** `status`, `cooldown_until`, `last_acquired_at`, and `consecutive_cooldown` are framework-owned lifecycle state. For administrative control, use `await pool.enable(id)` / `await pool.disable(id)` instead.
+- **Don't mutate `Resource` fields from outside the pool.** `status`, `cooldown_until`, `last_acquired_at`, and `consecutive_cooldown` are framework-owned lifecycle state. For administrative control, use `await pool.add(id, value)` / `await pool.enable(id)` / `await pool.disable(id)` instead.
 - **Don't share one `Pool` across asyncio event loops.** The internal lock binds to the loop where it was first awaited; reusing the pool from a different loop is undefined behaviour.
 
 ### Gotcha: cancellation only hits younger siblings

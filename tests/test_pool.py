@@ -1428,3 +1428,80 @@ class TestAdminEnableDisable:
             await pool.enable("nope")
         with pytest.raises(KeyError, match="unknown resource_id"):
             await pool.disable("nope")
+
+
+# ===================================================================
+# Group K — Dynamic add
+# ===================================================================
+
+
+class TestDynamicAdd:
+    async def test_k1_add_starts_healthy_and_participates_immediately(
+        self, ops: Ops
+    ) -> None:
+        """add() constructs a fresh healthy Resource and makes it selectable."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        assert await pool.run(ops.identity()) == "v0"
+
+        added = await pool.add("r1", "v1", max_in_flight=1)
+
+        assert added.resource_id == "r1"
+        assert added.value == "v1"
+        assert added.max_in_flight == 1
+        assert added.status == "healthy"
+        assert added.cooldown_until == 0.0
+        assert added.last_acquired_at == 0.0
+        assert added.consecutive_cooldown == 0
+
+        snap = pool.snapshot()["r1"]
+        assert snap["status"] == "healthy"
+        assert snap["in_flight"] == 0
+        assert snap["consecutive_cooldown"] == 0
+        assert snap["cooldown_seconds_remaining"] == 0.0
+        assert snap["last_acquired_at"] == 0.0
+
+        # r0 was acquired before add(); r1's default last_acquired_at=0.0 makes it
+        # the oldest healthy candidate and therefore immediately reachable.
+        assert await pool.run(ops.identity()) == "v1"
+
+    async def test_k2_add_rejects_duplicate_resource_id(self) -> None:
+        """add() preserves the same resource_id uniqueness invariant as init."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(ValueError, match="Duplicate resource_id"):
+            await pool.add("r0", "duplicate")
+
+        assert set(pool.snapshot()) == {"r0"}
+
+    async def test_k3_add_appends_under_primary_backup(self, ops: Ops) -> None:
+        """primary_backup keeps existing priorities; added resources append last."""
+        pool = Pool(
+            resources=_res(1),
+            cooldown_table=FAST_TABLE,
+            strategy="primary_backup",
+        )
+
+        await pool.add("r1", "v1")
+
+        for _ in range(3):
+            assert await pool.run(ops.identity()) == "v0"
+
+        await pool.disable("r0")
+        assert await pool.run(ops.identity()) == "v1"
+
+    async def test_k4_add_wakes_wait_for_cooldown_waiter(self, ops: Ops) -> None:
+        """A newly added healthy resource interrupts a cooldown wait."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(lambda: CooldownResource(cooldown_seconds=5.0)))
+
+        start = time.monotonic()
+        waiter = asyncio.create_task(
+            pool.run(ops.identity(), wait_for_cooldown=True, retry_delay=0)
+        )
+        await asyncio.sleep(0.03)
+        await pool.add("r1", "v1")
+
+        assert await waiter == "v1"
+        assert time.monotonic() - start < 1.0

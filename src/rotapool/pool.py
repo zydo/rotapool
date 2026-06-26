@@ -363,6 +363,40 @@ class Pool(AgentReadableMixin, Generic[T]):
             }
         return result
 
+    async def add(
+        self,
+        resource_id: str,
+        value: T,
+        *,
+        max_in_flight: int | None = None,
+    ) -> Resource[T]:
+        """Add a new healthy resource to the pool.
+
+        The caller supplies only the stable identity, the resource value, and the
+        optional capacity cap. Lifecycle state is always initialized from the
+        ``Resource`` defaults: healthy, no cooldown, no prior acquisition, and no
+        consecutive cooldown count. The new resource is appended to the pool's
+        insertion order, so it is the lowest-priority fallback under
+        ``"primary_backup"``.
+
+        Wakes any ``run(wait_for_cooldown=True)`` sleepers so a newly added healthy
+        resource can satisfy them immediately.
+
+        Raises ValueError for a duplicate ``resource_id`` or invalid ``Resource``
+        constructor arguments.
+        """
+        resource = Resource(
+            resource_id=resource_id,
+            value=value,
+            max_in_flight=max_in_flight,
+        )
+        async with self._admin_changed:
+            if resource.resource_id in self._resources:
+                raise ValueError(f"Duplicate resource_id in pool: {resource_id!r}")
+            self._resources[resource.resource_id] = resource
+            self._admin_changed.notify_all()
+        return resource
+
     async def enable(self, resource_id: str) -> None:
         """Administratively return a resource to selection.
 
@@ -731,7 +765,18 @@ and select again -- useful for batch jobs that prefer waiting over failing. It
 never waits on disabled or saturated resources (no known wake-up time), and with
 a ``deadline`` it raises immediately when the earliest expiry lands at or after
 it, rather than sleeping out a wait that cannot help. Admin ``enable()`` /
-``disable()`` interrupt the wait so the sleeper re-evaluates immediately.
+``disable()`` interrupt the wait so the sleeper re-evaluates immediately. Admin
+``add()`` also wakes waiters because newly added healthy capacity may satisfy
+them immediately.
+
+### Dynamic add
+
+Use ``await pool.add(resource_id, value, max_in_flight=None)`` to add new
+capacity at runtime. The pool constructs a fresh ``Resource`` with default
+lifecycle state (healthy, no cooldown, no acquisition history, no cooldown
+counter). Duplicate ``resource_id`` values raise ``ValueError``. Added resources
+append to pool order, so they are the lowest-priority fallback under
+``primary_backup`` unless earlier resources are unavailable.
 
 ### Anti-pattern: doing the real work OUTSIDE ``run()``
 
@@ -768,9 +813,10 @@ N ``run()`` invocations.
 - Catch and swallow exceptions inside the operation -- the pool needs to see
   them to decide resource health.
 - Mutate ``Resource`` fields from outside; the pool owns lifecycle state. For
-  administrative control use ``await pool.enable(id)`` / ``await pool.disable(id)``
-  (enable also clears any cooldown and resets the escalation counter; disable
-  never cancels in-flight work).
+  administrative control use ``await pool.add(id, value)`` /
+  ``await pool.enable(id)`` / ``await pool.disable(id)`` (enable also clears any
+  cooldown and resets the escalation counter; disable never cancels in-flight
+  work).
 - Share one ``Pool`` across asyncio event loops -- the lock binds to the loop
   where it was first awaited.
 
