@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import math
 import random
 import time
 import uuid
@@ -79,7 +80,8 @@ class Pool(AgentReadableMixin, Generic[T]):
             resource escalates one slot; the counter resets on the next success.
             Counts past the table length clamp to the last entry. Per-event
             ``CooldownResource(cooldown_seconds=...)`` (e.g. from ``Retry-After``)
-            overrides this for that one event without resetting the counter.
+            overrides this for that one event without resetting the counter. Entries
+            must be finite and >= 0.
 
         strategy: how the pool picks among resources that are eligible (not disabled,
             not cooling down, not at ``max_in_flight``). Pool-level by design --
@@ -106,8 +108,8 @@ class Pool(AgentReadableMixin, Generic[T]):
 
         if not cooldown_table:
             raise ValueError("cooldown_table must contain at least one entry")
-        if any(cd < 0 for cd in cooldown_table):
-            raise ValueError("cooldown_table entries must be >= 0")
+        if any(not math.isfinite(cd) or cd < 0 for cd in cooldown_table):
+            raise ValueError("cooldown_table entries must be finite and >= 0")
         self._cooldown_table: tuple[float, ...] = cooldown_table
 
         # Runtime guard for callers that bypass type checking. Cast widens the
@@ -132,6 +134,11 @@ class Pool(AgentReadableMixin, Generic[T]):
 
         # resource_id -> { usage_id_set }
         self._inflight_by_resource: dict[str, set[str]] = {}
+
+        # Monotonic per-pool sequence used to order usages exactly. Wall-clock and
+        # monotonic timestamps can tie on fast acquisitions; cancellation semantics
+        # need a deterministic "younger than" relation.
+        self._next_acquisition_order: int = 0
 
     async def run(
         self,
@@ -503,11 +510,13 @@ class Pool(AgentReadableMixin, Generic[T]):
                     ),
                 )
             selected.last_acquired_at = now
+            self._next_acquisition_order += 1
             usage = Usage(
                 usage_id=str(uuid.uuid4()),
                 request_id=request_id,
                 resource_id=selected.resource_id,
                 acquired_at=now,
+                acquisition_order=self._next_acquisition_order,
             )
             self._usages[usage.usage_id] = usage
             self._inflight_by_resource.setdefault(selected.resource_id, set()).add(
@@ -657,7 +666,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             self._usages.pop(usage.usage_id, None)
 
     def _collect_younger_usages_locked(self, failed_usage: Usage) -> list[Usage]:
-        """Mark and return usages on the same resource with acquired_at > failed.
+        """Mark and return usages on the same resource acquired after failed.
 
         MUST be called with `self._lock` held. Older usages are NOT touched -- they may
         still succeed (e.g. an upstream request that the remote side already accepted).
@@ -671,7 +680,7 @@ class Pool(AgentReadableMixin, Generic[T]):
                 continue
             if (
                 other.status == "in_flight"
-                and other.acquired_at > failed_usage.acquired_at
+                and other.acquisition_order > failed_usage.acquisition_order
                 and other.usage_id != failed_usage.usage_id
             ):
                 other.status = "cancelled"

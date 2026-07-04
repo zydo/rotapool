@@ -31,7 +31,7 @@ class Resource(Generic[T]):
     consecutive_cooldown: int = 0
 
     def __post_init__(self) -> None:
-        if not self.resource_id:
+        if not isinstance(self.resource_id, str) or not self.resource_id:
             raise ValueError("resource_id must be a non-empty string")
         if self.max_in_flight is not None and self.max_in_flight < 1:
             raise ValueError(
@@ -46,6 +46,9 @@ class Usage:
     `acquired_at` is a `time.monotonic()` reading, not an epoch timestamp — only
     meaningful relative to other `time.monotonic()` calls in this process.
 
+    `acquisition_order` is a per-pool monotonic sequence number used for exact
+    older/younger comparisons when multiple usages share the same timestamp.
+
     `task` holds a cancellable handle for the in-flight operation:
     - `asyncio.Task` when the operation returned a coroutine (framework wrapped it).
     - `asyncio.Future` when the operation directly returned a Future.
@@ -58,5 +61,6 @@ class Usage:
     request_id: str
     resource_id: str
     acquired_at: float
+    acquisition_order: int
     task: asyncio.Future | None = None
     status: UsageStatus = "in_flight"

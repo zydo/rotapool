@@ -39,6 +39,7 @@ from typing import (
 import pytest
 
 from rotapool import CooldownResource, DisableResource, Pool, PoolExhausted, Resource
+from rotapool.models import Usage
 
 FAST_TABLE = (0.05, 0.10, 0.15, 0.20)
 
@@ -788,6 +789,48 @@ class TestCancellation:
         assert snap["status"] == "cooling_down"
         assert snap["consecutive_cooldown"] == 1
 
+    async def test_e8_younger_collection_uses_acquisition_order_on_timestamp_ties(
+        self,
+    ) -> None:
+        """White-box: equal acquired_at timestamps still preserve younger ordering."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        same_time = 123.0
+        older = Usage(
+            usage_id="older",
+            request_id="req",
+            resource_id="r0",
+            acquired_at=same_time,
+            acquisition_order=1,
+        )
+        failed = Usage(
+            usage_id="failed",
+            request_id="req",
+            resource_id="r0",
+            acquired_at=same_time,
+            acquisition_order=2,
+        )
+        younger = Usage(
+            usage_id="younger",
+            request_id="req",
+            resource_id="r0",
+            acquired_at=same_time,
+            acquisition_order=3,
+        )
+        pool._usages.update({u.usage_id: u for u in (older, failed, younger)})  # pyright: ignore[reportPrivateUsage] # NOSONAR
+        pool._inflight_by_resource["r0"] = {
+            "older",
+            "failed",
+            "younger",
+        }  # pyright: ignore[reportPrivateUsage] # NOSONAR
+
+        async with pool._lock:  # pyright: ignore[reportPrivateUsage] # NOSONAR
+            to_cancel = pool._collect_younger_usages_locked(failed)  # pyright: ignore[reportPrivateUsage] # NOSONAR
+
+        assert to_cancel == [younger]
+        assert older.status == "in_flight"
+        assert failed.status == "in_flight"
+        assert younger.status == "cancelled"
+
     async def test_e7_external_cancel_propagates_for_uncancellable_awaitable(
         self,
     ) -> None:
@@ -1049,10 +1092,20 @@ class TestAPI:
         with pytest.raises(ValueError, match="cooldown_table must contain"):
             Pool(resources=_res(1), cooldown_table=())
 
-    def test_h11_construction_rejects_negative_cooldown(self) -> None:
-        """Negative cooldown_table entry → ValueError at construction."""
-        with pytest.raises(ValueError, match="cooldown_table entries must be >= 0"):
+    def test_h11_construction_rejects_bad_cooldown_table_entries(self) -> None:
+        """Negative, NaN, and infinite cooldown_table entries are rejected."""
+        with pytest.raises(
+            ValueError, match="cooldown_table entries must be finite and >= 0"
+        ):
             Pool(resources=_res(1), cooldown_table=(30.0, -1.0))
+        with pytest.raises(
+            ValueError, match="cooldown_table entries must be finite and >= 0"
+        ):
+            Pool(resources=_res(1), cooldown_table=(float("nan"),))
+        with pytest.raises(
+            ValueError, match="cooldown_table entries must be finite and >= 0"
+        ):
+            Pool(resources=_res(1), cooldown_table=(float("inf"),))
 
     def test_h12_dict_key_must_match_resource_id(self) -> None:
         """Dict key differing from resource_id → ValueError at construction.
@@ -1172,6 +1225,11 @@ class TestAPI:
         """Empty resource_id → ValueError at Resource construction."""
         with pytest.raises(ValueError, match="resource_id must be a non-empty"):
             Resource(resource_id="", value="v")
+
+    def test_h20_resource_rejects_non_string_resource_id(self) -> None:
+        """Non-string resource_id → ValueError at Resource construction."""
+        with pytest.raises(ValueError, match="resource_id must be a non-empty"):
+            Resource(resource_id=123, value="v")  # type: ignore[arg-type]
 
     def test_h17_resource_rejects_bad_max_in_flight(self) -> None:
         """max_in_flight < 1 → ValueError at Resource construction; None is fine."""

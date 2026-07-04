@@ -85,7 +85,7 @@ result = await call_upstream("https://api.example.com/v1/chat", {"prompt": "hi"}
 
 ```bash
 uv sync --all-extras
-uv run pytest
+uv run pytest --cov
 ```
 
 See [pitfalls and testing](docs/pitfalls-and-testing.md) for pip-based setup and additional notes.

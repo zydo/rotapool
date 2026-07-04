@@ -20,6 +20,7 @@ pool = Pool(
     # cooldown_table:  Escalation table indexed by consecutive_cooldown count.
     #                  1st cooldown -> cooldown_table[0], 2nd -> cooldown_table[1], etc.
     #                  Out-of-range values clamp to the last entry.
+    #                  Entries must be finite and >= 0.
 
     strategy: Literal["round_robin", "primary_backup"] = "round_robin",
     # strategy:        Selection policy among eligible resources. "round_robin"
