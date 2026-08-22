@@ -162,6 +162,9 @@ await pool.remove(resource_id: str) -> None
 # updates nothing, while a DisableResource still cancels younger siblings on
 # it. Does not fire on_state_change (membership, not a status transition).
 # Wakes wait_for_cooldown sleepers. Raises KeyError for an unknown resource_id.
+# Re-adding the id later starts fresh, except that usages still draining from
+# the removed resource count toward the re-added one's max_in_flight until
+# they finish (conservative during the overlap).
 ```
 
 ## `rotapool.Resource[T]`

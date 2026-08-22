@@ -1709,6 +1709,31 @@ class TestRemove:
         await pool.remove("r0")
         assert await pool.run(ops.identity()) == "v1"
 
+    async def test_l8_readd_counts_draining_usages(self, ops: Ops) -> None:
+        """Usages still draining from a removed resource count toward the
+        re-added same-id resource's in_flight (and max_in_flight) until they
+        finish -- capacity stays conservative during the overlap."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        release = asyncio.Event()
+
+        async def body(r: Resource[str]) -> str:
+            await release.wait()
+            return r.value
+
+        inflight = asyncio.create_task(pool.run(ops.op(body)))
+        await asyncio.sleep(0.02)
+        await pool.remove("r0")
+        await pool.add("r0", "v0-new", max_in_flight=1)
+
+        assert pool.snapshot()["r0"]["in_flight"] == 1  # draining usage counts
+        with pytest.raises(PoolExhausted, match="no eligible resource"):
+            await pool.run(ops.identity())  # already at max_in_flight=1
+
+        release.set()
+        assert await inflight == "v0"
+        assert pool.snapshot()["r0"]["in_flight"] == 0
+        assert await pool.run(ops.identity()) == "v0-new"
+
 
 # ===================================================================
 # Group M — on_state_change hook

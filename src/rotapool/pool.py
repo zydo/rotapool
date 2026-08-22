@@ -515,7 +515,11 @@ class Pool(AgentReadableMixin, Generic[T]):
         resource, and sleeping it out would provably not help.
 
         Raises KeyError for an unknown resource_id. Re-adding the same
-        ``resource_id`` later via ``add()`` starts from fresh default state.
+        ``resource_id`` later via ``add()`` starts from fresh default state,
+        with one overlap caveat: usages still draining from the removed
+        resource count toward the re-added one's in-flight total (and hence
+        its ``max_in_flight``) until they finish, so capacity is enforced
+        conservatively during the overlap.
         """
         async with self._admin_changed:
             self._get_resource(resource_id)
