@@ -16,6 +16,8 @@ jobs:
       - run: uv sync --all-extras
       - name: Check formatting
         run: uv run ruff format --check src tests
+      - name: Lint
+        run: uv run ruff check src tests
       - name: Type check
         run: uv run pyright
 

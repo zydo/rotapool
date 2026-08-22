@@ -53,10 +53,13 @@ await pool.run(
     # deadline:        Absolute time.monotonic() value that gates when each attempt may
     #                  start and caps the inter-attempt pause. Does not interrupt an
     #                  in-flight operation, so a single long call can overrun it. Raises
-    #                  PoolExhausted when a new attempt would start past it. None = none.
+    #                  PoolExhausted when a new attempt would start past it. Non-finite
+    #                  values (NaN, inf) raise ValueError -- comparisons against them
+    #                  never fire, which would silently disable the deadline. None = none.
 
     retry_delay: float = 0.5,
-    # retry_delay:     Base pause (seconds) between failed attempts. Must be >= 0.
+    # retry_delay:     Base pause (seconds) between failed attempts. Must be >= 0
+    #                  (negative and NaN raise ValueError before any attempt).
     #                  The actual pause is jittered to retry_delay * uniform(0.5, 1.5)
     #                  (mean stays retry_delay) so concurrent callers do not retry in
     #                  lockstep and stampede the next eligible resource.

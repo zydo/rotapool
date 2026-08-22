@@ -102,7 +102,9 @@ class Pool(AgentReadableMixin, Generic[T]):
         if not self._resources:
             raise ValueError("Pool requires at least one resource")
 
-        if max_attempts < 1:
+        # `not >= 1` instead of `< 1`: also rejects NaN, which would otherwise
+        # pass and surface later as `range(nan)` TypeError inside run().
+        if not max_attempts >= 1:
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
         self._max_attempts: int = max_attempts
 
@@ -178,6 +180,8 @@ class Pool(AgentReadableMixin, Generic[T]):
             does NOT interrupt an operation already in flight -- a single call that runs
             long can overrun the deadline, because the pool never cancels a usage that
             may already have upstream side effects. None disables the deadline.
+            Non-finite values (NaN, +-inf) are rejected up front: comparisons
+            against them never fire, which would silently disable the deadline.
 
         retry_delay: base pause between failed attempts to let cooling resources
             recover and to avoid hammering the pool. Must be >= 0. The actual pause
@@ -204,10 +208,17 @@ class Pool(AgentReadableMixin, Generic[T]):
             caller (e.g. an HTTP request-id header). Auto-generated UUID when None.
         """
         rid = request_id or str(uuid.uuid4())
-        if max_attempts is not None and max_attempts < 1:
+        # `not >=` instead of `<`: also rejects NaN, which would otherwise pass
+        # and surface far from the bug -- retry_delay as a mid-retry ValueError
+        # out of asyncio.sleep, max_attempts as `range(nan)` TypeError.
+        if max_attempts is not None and not max_attempts >= 1:
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
-        if retry_delay < 0:
+        if not retry_delay >= 0:
             raise ValueError(f"retry_delay must be >= 0, got {retry_delay}")
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError(
+                f"deadline must be a finite time.monotonic() value, got {deadline}"
+            )
         cap = max_attempts if max_attempts is not None else self._max_attempts
         effective_attempts = min(cap, len(self._resources))
         last_error: BaseException | None = None
@@ -344,13 +355,14 @@ class Pool(AgentReadableMixin, Generic[T]):
     def snapshot(self) -> dict[str, dict[str, Any]]:
         """Return a point-in-time summary of every resource in the pool.
 
-        Thread-safe without the lock -- reads simple types (str, int, float) and
-        Python-int counters that change atomically under the GIL. Good enough for
-        metrics / /status.
+        Thread-safe without the lock -- iterates a copy of the resource dict
+        (``add()`` can grow it from the event loop while another thread polls)
+        and reads simple types (str, int, float) that change atomically under
+        the GIL. Good enough for metrics / /status.
         """
         now = time.monotonic()
         result: dict[str, dict[str, Any]] = {}
-        for rid, r in self._resources.items():
+        for rid, r in list(self._resources.items()):
             inflight = len(self._inflight_by_resource.get(rid, set()))
             # The stored status flips to "healthy" lazily inside _acquire, so an
             # expired cooldown can linger as "cooling_down" on an idle pool. Report

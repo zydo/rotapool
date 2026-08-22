@@ -23,6 +23,7 @@ construction and the assertions.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections import Counter
 from typing import (
@@ -1083,9 +1084,15 @@ class TestAPI:
         assert sum(tally.values()) == 1
 
     def test_h8_construction_rejects_bad_max_attempts(self) -> None:
-        """max_attempts < 1 at construction → ValueError."""
+        """max_attempts < 1 (or NaN) at construction → ValueError. NaN would
+        otherwise surface later as `range(nan)` TypeError inside run()."""
         with pytest.raises(ValueError, match="max_attempts must be >= 1"):
             Pool(resources=_res(1), max_attempts=0)
+        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+            Pool(
+                resources=_res(1),
+                max_attempts=float("nan"),  # type: ignore[arg-type]
+            )
 
     def test_h9_construction_rejects_empty_cooldown_table(self) -> None:
         """Empty cooldown_table → ValueError at construction."""
@@ -1117,7 +1124,7 @@ class TestAPI:
             Pool(resources={"alias": Resource(resource_id="real", value="v")})
 
     async def test_h10_run_rejects_bad_max_attempts(self) -> None:
-        """Per-call max_attempts < 1 → ValueError before any attempt."""
+        """Per-call max_attempts < 1 (or NaN) → ValueError before any attempt."""
         pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
 
         async def op(r: Resource[str]) -> str:  # NOSONAR
@@ -1125,9 +1132,12 @@ class TestAPI:
 
         with pytest.raises(ValueError, match="max_attempts must be >= 1"):
             await pool.run(op, max_attempts=0)
+        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+            await pool.run(op, max_attempts=float("nan"))  # type: ignore[arg-type]
 
     async def test_h13_run_rejects_negative_retry_delay(self) -> None:
-        """Per-call retry_delay < 0 → ValueError before any attempt."""
+        """Per-call retry_delay < 0 or NaN → ValueError before any attempt. NaN
+        would otherwise blow up mid-retry inside asyncio.sleep( nan )."""
         pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
 
         async def op(r: Resource[str]) -> str:  # NOSONAR
@@ -1135,6 +1145,8 @@ class TestAPI:
 
         with pytest.raises(ValueError, match="retry_delay must be >= 0"):
             await pool.run(op, retry_delay=-0.1)
+        with pytest.raises(ValueError, match="retry_delay must be >= 0"):
+            await pool.run(op, retry_delay=float("nan"))
 
     async def test_h14_works_without_agent_readable(self) -> None:
         """agent-readable is optional: with its import blocked, the module falls
@@ -1232,9 +1244,16 @@ class TestAPI:
             Resource(resource_id=123, value="v")  # type: ignore[arg-type]
 
     def test_h17_resource_rejects_bad_max_in_flight(self) -> None:
-        """max_in_flight < 1 → ValueError at Resource construction; None is fine."""
+        """max_in_flight < 1 (or NaN) → ValueError at Resource construction; None
+        is fine. NaN would make the capacity check always false, i.e. unbounded."""
         with pytest.raises(ValueError, match="max_in_flight must be >= 1 or None"):
             Resource(resource_id="r0", value="v", max_in_flight=0)
+        with pytest.raises(ValueError, match="max_in_flight must be >= 1 or None"):
+            Resource(
+                resource_id="r0",
+                value="v",
+                max_in_flight=float("nan"),  # type: ignore[arg-type]
+            )
         Resource(resource_id="r0", value="v", max_in_flight=None)
         Resource(resource_id="r0", value="v", max_in_flight=1)
 
@@ -1247,6 +1266,18 @@ class TestAPI:
             CooldownResource(cooldown_seconds=float("nan"))
         CooldownResource(cooldown_seconds=0.0)
         CooldownResource(cooldown_seconds=None)
+
+    async def test_h21_run_rejects_non_finite_deadline(self) -> None:
+        """NaN/inf deadline → ValueError before any attempt. Comparisons against
+        non-finite values never fire, so they would silently disable the deadline."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        async def op(r: Resource[str]) -> str:  # NOSONAR
+            return r.value
+
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="deadline must be a finite"):
+                await pool.run(op, deadline=bad)
 
 
 # ===================================================================
@@ -1563,3 +1594,37 @@ class TestDynamicAdd:
 
         assert await waiter == "v1"
         assert time.monotonic() - start < 1.0
+
+    async def test_k5_snapshot_survives_concurrent_add(self) -> None:
+        """snapshot() from another thread is safe while add() grows the pool.
+
+        Regression test: snapshot used to iterate the live resource dict, so a
+        cross-thread metrics poll could hit "dictionary changed size during
+        iteration" while the event loop was adding resources.
+        """
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        stop = threading.Event()
+        failures: list[str] = []
+        polls = 0
+
+        def poll() -> None:
+            nonlocal polls
+            while not stop.is_set():
+                try:
+                    pool.snapshot()
+                    polls += 1
+                except RuntimeError as e:  # pragma: no cover
+                    failures.append(str(e))
+
+        poller = threading.Thread(target=poll)
+        poller.start()
+        try:
+            for i in range(50):
+                await pool.add(f"x{i}", f"v{i}")
+        finally:
+            stop.set()
+            poller.join()
+
+        assert not failures
+        assert polls > 0
+        assert len(pool.snapshot()) == 51

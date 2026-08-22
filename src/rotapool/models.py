@@ -33,7 +33,10 @@ class Resource(Generic[T]):
     def __post_init__(self) -> None:
         if not isinstance(self.resource_id, str) or not self.resource_id:
             raise ValueError("resource_id must be a non-empty string")
-        if self.max_in_flight is not None and self.max_in_flight < 1:
+        # `not >= 1` instead of `< 1`: also rejects NaN, which would make the
+        # capacity check (`current >= max_in_flight`) always false and the
+        # resource silently unbounded.
+        if self.max_in_flight is not None and not self.max_in_flight >= 1:
             raise ValueError(
                 f"max_in_flight must be >= 1 or None, got {self.max_in_flight}"
             )
