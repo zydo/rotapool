@@ -28,6 +28,21 @@ pool = Pool(
     #                  last_acquired_at. "primary_backup" returns the first eligible
     #                  resource in list/dict order (ordering is the priority ranking).
     #                  Pool-level by design; not overridable per call. See "Selection".
+
+    on_state_change: Callable[[str, ResourceStatus, ResourceStatus], None] | None = None,
+    # on_state_change: Monitoring hook called as on_state_change(resource_id,
+    #                  old_status, new_status) the moment a resource's health status
+    #                  changes, so operators can log/alert without polling snapshot().
+    #                  Fired for: CooldownResource (healthy -> cooling_down, and
+    #                  cooling_down -> cooling_down for escalations/extensions -- every
+    #                  cooldown event is delivered), DisableResource or admin disable()
+    #                  (any -> disabled), admin enable() (any -> healthy), and lazy
+    #                  cooldown expiry at selection time (cooling_down -> healthy).
+    #                  NOT fired for add()/remove() (membership, not status), success
+    #                  resets, or no-op admin calls. Called synchronously under the
+    #                  pool lock: keep it fast, never block, never call the pool's
+    #                  async methods (snapshot() is safe -- lock-free). Exceptions are
+    #                  logged to the "rotapool" logger and swallowed.
 )
 ```
 
@@ -104,6 +119,7 @@ pool.snapshot() -> dict[str, dict[str, Any]]
 #     "key-1": {
 #         "status": "healthy",                  # "healthy" | "cooling_down" | "disabled"
 #         "in_flight": 2,                       # Current in-flight usage count
+#         "max_in_flight": 4,                   # Concurrency cap (None = unlimited)
 #         "consecutive_cooldown": 0,            # Escalation counter
 #         "cooldown_seconds_remaining": 0.0,    # Seconds until cooldown expires (0 if healthy)
 #         "last_acquired_at": 12345.67,         # time.monotonic() of last acquire
@@ -136,6 +152,16 @@ await pool.disable(resource_id: str) -> None
 # usages are not cancelled (unlike an operation raising DisableResource) -- they
 # run to natural completion. Idempotent on an already-disabled resource.
 # Raises KeyError for an unknown resource_id.
+
+await pool.remove(resource_id: str) -> None
+# Drop a resource from the pool entirely -- the counterpart to add(). The
+# resource disappears from selection and snapshot() immediately, and the pool
+# stops referencing its value (unlike disable(), which keeps it in memory --
+# remove is for rotated/revoked secrets). In-flight usages finish naturally,
+# exactly like admin disable(); a late CooldownResource from such a usage
+# updates nothing, while a DisableResource still cancels younger siblings on
+# it. Does not fire on_state_change (membership, not a status transition).
+# Wakes wait_for_cooldown sleepers. Raises KeyError for an unknown resource_id.
 ```
 
 ## `rotapool.Resource[T]`

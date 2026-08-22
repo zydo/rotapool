@@ -23,6 +23,7 @@ construction and the assertions.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from collections import Counter
@@ -1029,18 +1030,20 @@ class TestAPI:
 
     async def test_h5_snapshot_schema(self) -> None:
         """snapshot() returns the documented keys and types."""
-        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        pool = Pool(resources=_res(1, max_in_flight=2), cooldown_table=FAST_TABLE)
 
         snap = pool.snapshot()
         assert set(snap["r0"].keys()) == {
             "status",
             "in_flight",
+            "max_in_flight",
             "consecutive_cooldown",
             "cooldown_seconds_remaining",
             "last_acquired_at",
         }
         assert snap["r0"]["status"] == "healthy"
         assert isinstance(snap["r0"]["in_flight"], int)
+        assert snap["r0"]["max_in_flight"] == 2
         assert isinstance(snap["r0"]["consecutive_cooldown"], int)
         assert isinstance(snap["r0"]["cooldown_seconds_remaining"], float)
         assert isinstance(snap["r0"]["last_acquired_at"], float)
@@ -1594,6 +1597,291 @@ class TestDynamicAdd:
 
         assert await waiter == "v1"
         assert time.monotonic() - start < 1.0
+
+
+# ===================================================================
+# Group L — remove()
+# ===================================================================
+
+
+class TestRemove:
+    async def test_l1_remove_drops_from_selection_and_snapshot(self, ops: Ops) -> None:
+        """remove() makes the resource invisible to selection and snapshot()."""
+        pool = Pool(resources=_res(2), cooldown_table=FAST_TABLE)
+        await pool.remove("r0")
+
+        assert set(pool.snapshot()) == {"r1"}
+        for _ in range(3):
+            assert await pool.run(ops.identity()) == "v1"
+
+    async def test_l2_remove_unknown_raises_keyerror(self) -> None:
+        """remove() on an id the pool does not manage → KeyError."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        with pytest.raises(KeyError, match="unknown resource_id"):
+            await pool.remove("nope")
+
+    async def test_l3_inflight_drains_after_remove(self, ops: Ops) -> None:
+        """Like admin disable(), remove() is policy: in-flight usages finish
+        naturally instead of being cancelled."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        release = asyncio.Event()
+
+        async def body(r: Resource[str]) -> str:
+            await release.wait()
+            return r.value
+
+        inflight = asyncio.create_task(pool.run(ops.op(body)))
+        await asyncio.sleep(0.02)
+
+        await pool.remove("r0")
+        assert set(pool.snapshot()) == set()
+        with pytest.raises(PoolExhausted, match="no eligible resource"):
+            await pool.run(ops.identity())
+
+        release.set()
+        assert await inflight == "v0"
+
+    async def test_l4_late_cooldown_signal_for_removed_resource(self) -> None:
+        """A CooldownResource raised by a drained usage of a removed resource
+        updates nothing (the resource is gone) and does not crash the run."""
+        pool = Pool(resources=_res(2), cooldown_table=FAST_TABLE)
+        release = asyncio.Event()
+
+        async def body(r: Resource[str]) -> str:
+            await release.wait()
+            if r.resource_id == "r0":
+                raise CooldownResource(reason="late signal")
+            return r.value
+
+        task = asyncio.create_task(pool.run(body, max_attempts=1))
+        await asyncio.sleep(0.02)  # round_robin picks r0 first
+        await pool.remove("r0")
+        release.set()
+
+        with pytest.raises(PoolExhausted):
+            await task
+        assert set(pool.snapshot()) == {"r1"}
+        assert await pool.run(body) == "v1"
+
+    async def test_l5_remove_wakes_waiter(self, ops: Ops) -> None:
+        """A waiter sleeping toward the removed resource's cooldown wakes,
+        re-evaluates, and fails fast instead of sleeping out a dead plan."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(lambda: CooldownResource(cooldown_seconds=5.0)))
+
+        start = time.monotonic()
+        waiter = asyncio.create_task(
+            pool.run(ops.identity(), wait_for_cooldown=True, retry_delay=0)
+        )
+        await asyncio.sleep(0.03)
+        await pool.remove("r0")
+
+        with pytest.raises(PoolExhausted):
+            await waiter
+        assert time.monotonic() - start < 1.0
+
+    async def test_l6_readd_same_id_starts_fresh(self, ops: Ops) -> None:
+        """Removing and re-adding the same id starts from default lifecycle
+        state -- the old cooldown history does not carry over."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(ops.raising(lambda: CooldownResource(reason="hot")))
+        assert pool.snapshot()["r0"]["consecutive_cooldown"] == 1
+
+        await pool.remove("r0")
+        await pool.add("r0", "v0-new")
+
+        snap = pool.snapshot()["r0"]
+        assert snap["status"] == "healthy"
+        assert snap["consecutive_cooldown"] == 0
+        assert await pool.run(ops.identity()) == "v0-new"
+
+    async def test_l7_remove_head_under_primary_backup(self, ops: Ops) -> None:
+        """Removing the primary promotes the next resource in pool order."""
+        pool = Pool(
+            resources=_res(2),
+            cooldown_table=FAST_TABLE,
+            strategy="primary_backup",
+        )
+        await pool.remove("r0")
+        assert await pool.run(ops.identity()) == "v1"
+
+
+# ===================================================================
+# Group M — on_state_change hook
+# ===================================================================
+
+
+class TestStateChangeHook:
+    @staticmethod
+    def _recorder() -> tuple[
+        list[tuple[str, str, str]], Callable[[str, str, str], None]
+    ]:
+        events: list[tuple[str, str, str]] = []
+
+        def hook(resource_id: str, old: str, new: str) -> None:
+            events.append((resource_id, old, new))
+
+        return events, hook
+
+    async def test_m1_cooldown_fires_transition(self) -> None:
+        """CooldownResource → ("r0", "healthy", "cooling_down")."""
+        events, hook = self._recorder()
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook)
+
+        async def cooler(r: Resource[str]) -> str:
+            raise CooldownResource(reason="busy")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cooler)
+        assert events == [("r0", "healthy", "cooling_down")]
+
+    async def test_m2_escalation_fires_cooling_to_cooling(self) -> None:
+        """A CooldownResource from an older usage landing while the resource is
+        already cooling_down is an escalation: delivered with old == new."""
+        events, hook = self._recorder()
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook)
+        older_release = asyncio.Event()
+        younger_release = asyncio.Event()
+
+        async def older(r: Resource[str]) -> str:
+            await older_release.wait()
+            raise CooldownResource(reason="older usage fails later")
+
+        async def younger(r: Resource[str]) -> str:
+            await younger_release.wait()
+            raise CooldownResource(reason="younger usage fails first")
+
+        older_task = asyncio.create_task(pool.run(older))
+        await asyncio.sleep(0.02)
+        younger_task = asyncio.create_task(pool.run(younger))
+        await asyncio.sleep(0.02)
+
+        younger_release.set()  # healthy -> cooling_down (older is not cancelled)
+        await asyncio.sleep(0.02)
+        older_release.set()  # escalation while already cooling_down
+
+        with pytest.raises(PoolExhausted):
+            await younger_task
+        with pytest.raises(PoolExhausted):
+            await older_task
+        assert events == [
+            ("r0", "healthy", "cooling_down"),
+            ("r0", "cooling_down", "cooling_down"),
+        ]
+
+    async def test_m3_disable_via_signal_and_admin(self) -> None:
+        """DisableResource and admin disable() both fire any -> disabled; a
+        second disable on the same resource fires nothing."""
+        events, hook = self._recorder()
+        pool = Pool(resources=_res(2), cooldown_table=FAST_TABLE, on_state_change=hook)
+
+        async def breaker(r: Resource[str]) -> str:
+            raise DisableResource(reason="dead")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(breaker, max_attempts=1)  # r0 -> disabled
+        await pool.disable("r1")  # admin: r1 -> disabled
+        await pool.disable("r0")  # already disabled: no event
+
+        assert events == [
+            ("r0", "healthy", "disabled"),
+            ("r1", "healthy", "disabled"),
+        ]
+
+    async def test_m4_enable_fires_and_is_idempotent(self) -> None:
+        """enable() fires disabled/cooling_down -> healthy on each real flip;
+        enabling a healthy resource fires nothing."""
+        events, hook = self._recorder()
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook)
+
+        await pool.disable("r0")
+        await pool.enable("r0")
+        await pool.enable("r0")  # no-op
+
+        async def cooler(r: Resource[str]) -> str:
+            raise CooldownResource(cooldown_seconds=5.0)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cooler, max_attempts=1)
+        await pool.enable("r0")  # cooling_down -> healthy
+
+        assert events == [
+            ("r0", "healthy", "disabled"),
+            ("r0", "disabled", "healthy"),
+            ("r0", "healthy", "cooling_down"),
+            ("r0", "cooling_down", "healthy"),
+        ]
+
+    async def test_m5_expiry_fires_at_selection(self) -> None:
+        """Lazy cooldown expiry fires cooling_down -> healthy inside _acquire."""
+        events, hook = self._recorder()
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook)
+
+        async def cooler(r: Resource[str]) -> str:
+            raise CooldownResource(reason="busy")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cooler, max_attempts=1)
+        await asyncio.sleep(FAST_TABLE[0] + 0.05)
+
+        async def ok(r: Resource[str]) -> str:
+            return r.value
+
+        assert await pool.run(ok) == "v0"
+        assert events == [
+            ("r0", "healthy", "cooling_down"),
+            ("r0", "cooling_down", "healthy"),
+        ]
+
+    async def test_m6_hook_exception_logged_and_swallowed(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A raising hook must not break the transition or the run loop."""
+
+        def bad_hook(resource_id: str, old: str, new: str) -> None:
+            raise RuntimeError("hook bug")
+
+        pool = Pool(
+            resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=bad_hook
+        )
+
+        async def cooler(r: Resource[str]) -> str:
+            raise CooldownResource(reason="busy")
+
+        with caplog.at_level(logging.ERROR, logger="rotapool.pool"):
+            with pytest.raises(PoolExhausted):
+                await pool.run(cooler)
+        assert any(
+            "on_state_change callback failed" in record.getMessage()
+            for record in caplog.records
+        )
+        # The transition itself still happened.
+        assert pool.snapshot()["r0"]["status"] == "cooling_down"
+
+    def test_m7_non_callable_hook_rejected(self) -> None:
+        """on_state_change that is not callable → TypeError at construction."""
+        with pytest.raises(TypeError, match="on_state_change must be callable"):
+            Pool(
+                resources=_res(1),
+                on_state_change="not-callable",  # type: ignore[arg-type]
+            )
+
+    async def test_m8_membership_and_success_do_not_fire(self, ops: Ops) -> None:
+        """add()/remove() are membership, not status transitions, and a
+        successful usage (cooldown-state reset) fires nothing either."""
+        events, hook = self._recorder()
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook)
+
+        assert await pool.run(ops.identity()) == "v0"
+        await pool.add("r1", "v1")
+        assert await pool.run(ops.identity()) == "v1"
+        await pool.remove("r1")
+
+        assert events == []
 
     async def test_k5_snapshot_survives_concurrent_add(self) -> None:
         """snapshot() from another thread is safe while add() grows the pool.

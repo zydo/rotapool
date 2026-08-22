@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import logging
 import math
 import random
 import time
@@ -34,7 +35,9 @@ else:
 
 
 from .exceptions import CooldownResource, DisableResource, PoolExhausted
-from .models import Resource, Usage
+from .models import Resource, ResourceStatus, Usage
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -57,8 +60,10 @@ class Pool(AgentReadableMixin, Generic[T]):
         max_attempts: int = 3,
         cooldown_table: tuple[float, ...] = _DEFAULT_COOLDOWN_TABLE,
         strategy: Strategy = "round_robin",
+        on_state_change: Callable[[str, ResourceStatus, ResourceStatus], None]
+        | None = None,
     ) -> None:
-        """Construct a pool over a fixed set of interchangeable resources.
+        """Construct a pool over a set of interchangeable resources.
 
         resources: the resources this pool manages. Accepts either a list of
             ``Resource`` objects (their ``resource_id`` fields must be unique) or a
@@ -96,6 +101,28 @@ class Pool(AgentReadableMixin, Generic[T]):
               eligible one. Later resources are reached only when earlier ones are
               cooling down, disabled, or at ``max_in_flight``. The order you pass
               ``resources`` in is the priority ranking.
+
+        on_state_change: optional monitoring hook invoked as
+            ``on_state_change(resource_id, old_status, new_status)`` the moment
+            a resource's health status changes, so operators can log or alert
+            without polling ``snapshot()``. Delivery rules:
+
+            - Fired for: an operation raising ``CooldownResource`` (healthy ->
+              cooling_down, and cooling_down -> cooling_down when an escalation
+              or extension lands while already cooling -- the status alone
+              cannot express magnitude, so every cooldown event is delivered),
+              ``DisableResource`` or admin ``disable()`` (any -> disabled),
+              admin ``enable()`` (any -> healthy), and lazy cooldown expiry at
+              selection time (cooling_down -> healthy).
+            - Not fired for: ``add()`` / ``remove()`` (membership, not a status
+              transition), cooldown-state resets on success, or no-op admin
+              calls (``enable()`` on an already-healthy resource).
+
+            The hook is called synchronously while the pool lock is held: keep
+            it fast, never block, and never call the pool's ``async`` methods
+            from it (``snapshot()`` is safe -- it is lock-free). An exception
+            raised by the hook is logged to the ``rotapool`` logger and
+            swallowed; monitoring must not break failover.
         """
         # resource_id -> resource
         self._resources: dict[str, Resource[T]] = self._build_resources(resources)
@@ -121,6 +148,13 @@ class Pool(AgentReadableMixin, Generic[T]):
                 f"strategy must be 'round_robin' or 'primary_backup', got {strategy!r}"
             )
         self._strategy: Strategy = strategy
+
+        if on_state_change is not None and not callable(on_state_change):
+            raise TypeError(
+                "on_state_change must be callable or None, got "
+                f"{type(on_state_change).__name__}"
+            )
+        self._on_state_change = on_state_change
 
         # Guards all possibly racing states.
         self._lock: asyncio.Lock = asyncio.Lock()
@@ -221,6 +255,11 @@ class Pool(AgentReadableMixin, Generic[T]):
             )
         cap = max_attempts if max_attempts is not None else self._max_attempts
         effective_attempts = min(cap, len(self._resources))
+        if effective_attempts < 1:
+            # Only reachable via remove() emptying the pool (construction
+            # requires >= 1 resource). Report the real cause instead of falling
+            # through to "max_attempts=0 exhausted: None".
+            raise PoolExhausted("no eligible resource in pool")
         last_error: BaseException | None = None
 
         for attempt_num in range(effective_attempts):
@@ -376,6 +415,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             result[rid] = {
                 "status": status,
                 "in_flight": inflight,
+                "max_in_flight": r.max_in_flight,
                 "consecutive_cooldown": r.consecutive_cooldown,
                 "cooldown_seconds_remaining": cooldown_remaining,
                 "last_acquired_at": r.last_acquired_at,
@@ -430,9 +470,11 @@ class Pool(AgentReadableMixin, Generic[T]):
         """
         async with self._admin_changed:
             resource = self._get_resource(resource_id)
-            resource.status = "healthy"
+            # Clear cooldown state before the flip so the on_state_change
+            # callback (if any) observes the fully-recovered resource.
             resource.cooldown_until = 0.0
             resource.consecutive_cooldown = 0
+            self._set_resource_status_locked(resource, "healthy")
             self._admin_changed.notify_all()
 
     async def disable(self, resource_id: str) -> None:
@@ -448,7 +490,36 @@ class Pool(AgentReadableMixin, Generic[T]):
         Raises KeyError for an unknown resource_id.
         """
         async with self._admin_changed:
-            self._get_resource(resource_id).status = "disabled"
+            resource = self._get_resource(resource_id)
+            self._set_resource_status_locked(resource, "disabled")
+            self._admin_changed.notify_all()
+
+    async def remove(self, resource_id: str) -> None:
+        """Drop a resource from the pool entirely -- the counterpart to ``add()``.
+
+        The resource disappears from selection and ``snapshot()`` immediately,
+        and the pool stops referencing its ``value`` -- unlike ``disable()``,
+        which keeps the (often secret) value in memory. In-flight usages
+        acquired before removal finish naturally, exactly like admin
+        ``disable()``: removal is policy, not failure evidence, so running work
+        that may already have upstream side effects is never cancelled. Their
+        bookkeeping drains on completion; a late ``CooldownResource`` from such
+        a usage updates nothing (the resource is gone), while a
+        ``DisableResource`` still cancels younger sibling usages on it -- they
+        are talking to the same dead backend. Does not fire
+        ``on_state_change``: removal is a membership change, not a status
+        transition.
+
+        Wakes any ``run(wait_for_cooldown=True)`` sleepers so they re-evaluate
+        -- a cooldown they were waiting on may have belonged to the removed
+        resource, and sleeping it out would provably not help.
+
+        Raises KeyError for an unknown resource_id. Re-adding the same
+        ``resource_id`` later via ``add()`` starts from fresh default state.
+        """
+        async with self._admin_changed:
+            self._get_resource(resource_id)
+            del self._resources[resource_id]
             self._admin_changed.notify_all()
 
     def _get_resource(self, resource_id: str) -> Resource[T]:
@@ -456,6 +527,38 @@ class Pool(AgentReadableMixin, Generic[T]):
         if resource is None:
             raise KeyError(f"unknown resource_id: {resource_id!r}")
         return resource
+
+    def _set_resource_status_locked(
+        self, resource: Resource[T], new_status: ResourceStatus
+    ) -> None:
+        """Flip ``resource.status`` and fire ``on_state_change`` on a real change.
+
+        MUST be called with the pool lock held. A no-op (and no event) when the
+        status is unchanged -- e.g. a second ``DisableResource`` from a usage on
+        an already-disabled resource, or an idempotent admin call.
+        """
+        old_status = resource.status
+        if old_status == new_status:
+            return
+        resource.status = new_status
+        self._notify_state_change_locked(resource.resource_id, old_status, new_status)
+
+    def _notify_state_change_locked(
+        self, resource_id: str, old_status: ResourceStatus, new_status: ResourceStatus
+    ) -> None:
+        """Invoke the ``on_state_change`` hook; MUST hold the pool lock.
+
+        Escalation events (a cooldown landing while already cooling_down) are
+        delivered with old == new == "cooling_down" -- callers that only care
+        about flips can simply compare the two statuses.
+        """
+        if self._on_state_change is None:
+            return
+        try:
+            self._on_state_change(resource_id, old_status, new_status)
+        except Exception:
+            # Monitoring must never break failover: log and move on.
+            logger.exception("on_state_change callback failed for %s", resource_id)
 
     @staticmethod
     def _build_resources(
@@ -496,7 +599,7 @@ class Pool(AgentReadableMixin, Generic[T]):
 
                 if r.status == "cooling_down":
                     if r.cooldown_until <= now:
-                        r.status = "healthy"
+                        self._set_resource_status_locked(r, "healthy")
                     else:
                         continue
 
@@ -630,6 +733,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             if resource is None or resource.status == "disabled":
                 return
 
+            old_status = resource.status
             resource.consecutive_cooldown += 1
 
             if cooldown_seconds is not None:
@@ -641,6 +745,13 @@ class Pool(AgentReadableMixin, Generic[T]):
 
             resource.status = "cooling_down"
             resource.cooldown_until = max(resource.cooldown_until, now + cd)
+
+            # Delivered even when old_status is already "cooling_down": an
+            # escalation or extension changes magnitude, not status, and the
+            # hook is the only push-notification channel for it.
+            self._notify_state_change_locked(
+                resource.resource_id, old_status, "cooling_down"
+            )
 
             to_cancel = self._collect_younger_usages_locked(usage)
 
@@ -659,7 +770,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             usage.status = "done"
             resource = self._resources.get(usage.resource_id)
             if resource is not None:
-                resource.status = "disabled"
+                self._set_resource_status_locked(resource, "disabled")
 
             to_cancel = self._collect_younger_usages_locked(usage)
 
@@ -788,7 +899,8 @@ a ``deadline`` it raises immediately when the earliest expiry lands at or after
 it, rather than sleeping out a wait that cannot help. Admin ``enable()`` /
 ``disable()`` interrupt the wait so the sleeper re-evaluates immediately. Admin
 ``add()`` also wakes waiters because newly added healthy capacity may satisfy
-them immediately.
+them immediately, and ``remove()`` wakes them because a cooldown they were
+waiting on may have belonged to the removed resource.
 
 ### Dynamic add
 
@@ -798,6 +910,30 @@ lifecycle state (healthy, no cooldown, no acquisition history, no cooldown
 counter). Duplicate ``resource_id`` values raise ``ValueError``. Added resources
 append to pool order, so they are the lowest-priority fallback under
 ``primary_backup`` unless earlier resources are unavailable.
+
+``await pool.remove(resource_id)`` is the counterpart: the resource and its
+value leave selection and ``snapshot()`` entirely (``disable()`` keeps the
+value in memory -- remove is for rotated/revoked secrets). In-flight usages
+drain naturally, like admin disable. Raises ``KeyError`` for unknown ids.
+
+### Observability: on_state_change
+
+``snapshot()`` is poll-based. For push notifications, pass a callback to the
+constructor:
+
+```python
+events: list[tuple[str, str, str]] = []
+pool = Pool(
+    resources,
+    on_state_change=lambda rid, old, new: events.append((rid, old, new)),
+)
+```
+
+It fires on cooldown events (escalations arrive as ``cooling_down ->
+cooling_down``), disables (signal or admin), admin enables, and cooldown
+expiry at selection time -- not on ``add()`` / ``remove()``, success resets,
+or no-op admin calls. It runs synchronously under the pool lock: keep it fast;
+exceptions are logged to the ``rotapool`` logger and swallowed.
 
 ### Anti-pattern: doing the real work OUTSIDE ``run()``
 
@@ -835,9 +971,10 @@ N ``run()`` invocations.
   them to decide resource health.
 - Mutate ``Resource`` fields from outside; the pool owns lifecycle state. For
   administrative control use ``await pool.add(id, value)`` /
-  ``await pool.enable(id)`` / ``await pool.disable(id)`` (enable also clears any
-  cooldown and resets the escalation counter; disable never cancels in-flight
-  work).
+  ``await pool.enable(id)`` / ``await pool.disable(id)`` /
+  ``await pool.remove(id)`` (enable also clears any cooldown and resets the
+  escalation counter; disable never cancels in-flight work; remove drops the
+  resource and its value entirely while in-flight work drains).
 - Share one ``Pool`` across asyncio event loops -- the lock binds to the loop
   where it was first awaited.
 

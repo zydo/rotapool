@@ -52,7 +52,7 @@ Each consecutive `CooldownResource` from the same resource escalates the cooldow
 | 3rd               | 300s     |
 | 4th+              | 600s     |
 
-You can override per event: `CooldownResource(cooldown_seconds=5)`, for example from a `Retry-After` header. The counter resets on the next success.
+You can override per event: `CooldownResource(cooldown_seconds=5)`, for example from a `Retry-After` header. The counter resets on the next success. An explicit cooldown is a floor, not a replacement: the new expiry is `max(current, now + seconds)`, so a short `Retry-After` never shortens a longer cooldown that is already running on that resource.
 
 Custom tables are supported per pool:
 
@@ -81,17 +81,40 @@ With a `deadline`, the wait only happens when the earliest cooldown ends before 
 
 The wake-up is jittered too: each waiter sleeps an extra `retry_delay * uniform(0, 1)` past the expiry, capped by `deadline`, so concurrent waiters do not all fire at the recovered resource in the same instant. As with the retry pause, `retry_delay=0` disables the jitter.
 
-Waiters also react to admin calls: `pool.add()` wakes them so they can acquire newly added capacity immediately, `pool.enable()` wakes them so they can acquire the now-eligible resource immediately, and `pool.disable()` wakes them so they can re-evaluate and fail fast instead of sleeping out a cooldown that no longer matters.
+Waiters also react to admin calls: `pool.add()` wakes them so they can acquire newly added capacity immediately, `pool.enable()` wakes them so they can acquire the now-eligible resource immediately, `pool.disable()` and `pool.remove()` wake them so they can re-evaluate and fail fast instead of sleeping out a cooldown that no longer matters.
 
 ## Admin Control
 
-`pool.add(resource_id, value, max_in_flight=None)`, `pool.enable(resource_id)`, and `pool.disable(resource_id)` give operators write access to resource lifecycle state -- the counterpart to `snapshot()`:
+`pool.add(resource_id, value, max_in_flight=None)`, `pool.enable(resource_id)`, `pool.disable(resource_id)`, and `pool.remove(resource_id)` give operators write access to resource lifecycle state -- the counterpart to `snapshot()`:
 
 - **`add()`** adds new capacity at runtime. You pass only `resource_id`, `value`, and optional `max_in_flight`; the pool constructs a fresh healthy `Resource` with no cooldown history. Duplicate `resource_id`s raise `ValueError`. Added resources append to pool order, so under `primary_backup` they are the lowest-priority fallback until earlier resources become unavailable.
+- **`remove()`** drops a resource from the pool entirely: it disappears from selection and `snapshot()`, and the pool stops referencing its `value` -- unlike `disable()`, which keeps the (often secret) value in memory. In-flight usages finish naturally, exactly like admin disable. Raises `KeyError` for an unknown `resource_id`; re-adding the same id later starts from fresh default state.
 - **`disable()`** removes a resource from selection until `enable()` is called. Unlike an operation raising `DisableResource`, in-flight usages are not cancelled -- admin disable is policy, not failure evidence, so running work, which may already have upstream side effects, finishes naturally.
 - **`enable()`** returns a resource to selection: it clears both the disabled state and any active cooldown, and resets `consecutive_cooldown` to 0. Enable means "the operator says this resource is usable now", for example a rotated key, so if the operator is wrong, escalation restarts from the first `cooldown_table` slot rather than resuming where it left off.
 
-All three are async because they take the pool lock. `enable()` / `disable()` are idempotent, raise `KeyError` for an unknown `resource_id`, and wake any `run(wait_for_cooldown=True)` sleepers so they re-evaluate immediately. `add()` also wakes those sleepers because a new healthy resource may satisfy them immediately.
+All four are async because they take the pool lock. `enable()` / `disable()` are idempotent, and all raise `KeyError` for an unknown `resource_id`. Each wakes any `run(wait_for_cooldown=True)` sleepers so they re-evaluate immediately.
+
+## Observability
+
+`snapshot()` is the poll-based view: per resource, `status`, `in_flight`, `max_in_flight` (the cap that makes `in_flight` interpretable), `consecutive_cooldown`, `cooldown_seconds_remaining`, and `last_acquired_at`. It is lock-free and thread-safe, and reports an expired cooldown as `healthy` even though the stored status only flips on the next acquire.
+
+For push notifications, pass an `on_state_change` callback to the constructor:
+
+```python
+pool = Pool(resources, on_state_change=log_resource_event)
+
+def log_resource_event(resource_id: str, old: str, new: str) -> None:
+    logging.info("rotapool: %s %s -> %s", resource_id, old, new)
+```
+
+It is called at the moment a resource's health status changes:
+
+- **Cooldown** -- `healthy -> cooling_down`, and `cooling_down -> cooling_down` when an escalation or extension lands while already cooling (the status alone cannot express magnitude, so every cooldown event is delivered; compare the two statuses if you only care about flips).
+- **Disable** -- `any -> disabled`, from an operation raising `DisableResource` or admin `disable()`.
+- **Enable** -- `any -> healthy`, including cooldown recovery.
+- **Expiry** -- `cooling_down -> healthy`, fired lazily at selection time when an expired cooldown is observed.
+
+It is not called for `add()` / `remove()` (membership, not a status transition), cooldown-state resets on success, or no-op admin calls such as enabling a healthy resource. The hook runs synchronously while the pool lock is held: keep it fast, never block, and never call the pool's `async` methods from it (`snapshot()` is safe -- it is lock-free). An exception raised by the hook is logged to the `rotapool` logger and swallowed; monitoring must not break failover.
 
 ## Cancellation Discrimination
 
