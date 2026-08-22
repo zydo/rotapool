@@ -1,6 +1,8 @@
 name: CI
 
-on: [push, pull_request]
+# workflow_call lets publish.yml run this same lint + test matrix against a
+# tagged commit before releasing, so the two files never drift apart.
+on: [push, pull_request, workflow_call]
 
 jobs:
   lint:

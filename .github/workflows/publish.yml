@@ -6,7 +6,14 @@ on:
       - "v*"
 
 jobs:
+  ci:
+    # A tag is release intent, not proof the commit passed CI -- it can point
+    # at a commit whose branch CI never ran or has not finished. Run the full
+    # lint + test matrix against the tagged commit before building anything.
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
