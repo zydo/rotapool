@@ -2,7 +2,21 @@ name: CI
 
 # workflow_call lets publish.yml run this same lint + test matrix against a
 # tagged commit before releasing, so the two files never drift apart.
-on: [push, pull_request, workflow_call]
+#
+# Tag pushes are ignored here: `on: push` would otherwise start a second CI
+# alongside publish.yml's workflow_call. Those two (and a same-SHA branch
+# push) share setup-uv cache keys and race with "Unable to reserve cache".
+on:
+  push:
+    tags-ignore: ["v*"]
+  pull_request:
+  workflow_call:
+
+# One CI run per commit. A main push and a tag's workflow_call of this file
+# would otherwise overlap and fight over the uv cache.
+concurrency:
+  group: ci-${{ github.sha }}
+  cancel-in-progress: true
 
 jobs:
   lint:
