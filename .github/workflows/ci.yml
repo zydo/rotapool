@@ -17,9 +17,9 @@ jobs:
           cache-suffix: lint-py3.14
       - run: uv sync --all-extras
       - name: Check formatting
-        run: uv run ruff format --check src tests
+        run: uv run ruff format --check src tests examples
       - name: Lint
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests examples
       - name: Type check
         run: uv run pyright
 
@@ -39,3 +39,8 @@ jobs:
           cache-suffix: test-py${{ matrix.python-version }}
       - run: uv sync --all-extras
       - run: uv run pytest -q --cov-fail-under=100
+      - name: Examples
+        run: |
+          uv run python examples/basic_usage.py
+          uv run python examples/prometheus_pool.py --once | tee /tmp/rotapool-metrics.txt
+          grep -q rotapool_runs_total /tmp/rotapool-metrics.txt

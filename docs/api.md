@@ -41,8 +41,9 @@ pool = Pool(
     #                  NOT fired for add()/remove() (membership, not status), success
     #                  resets, or no-op admin calls. Called synchronously under the
     #                  pool lock: keep it fast, never block, never call the pool's
-    #                  async methods (snapshot() is safe -- lock-free). Exceptions are
-    #                  logged to the "rotapool" logger and swallowed.
+    #                  async methods (snapshot() and stats() are safe -- lock-free).
+    #                  Exceptions are logged to the "rotapool" logger and swallowed.
+    #                  Do not use it as a metrics bus.
 )
 ```
 
@@ -113,7 +114,9 @@ await pool.run(
 pool.snapshot() -> dict[str, dict[str, Any]]
 # Returns a point-in-time summary of every resource. Thread-safe without the lock.
 # A resource whose cooldown has expired is reported as "healthy" even though the
-# stored status only flips on the next acquire.
+# stored status only flips on the next acquire. Operator / JSON view -- includes
+# last_acquired_at (a time.monotonic() reading, not a scrape timestamp). For
+# counters and Prometheus-ready gauges, use stats().
 # Example return value:
 # {
 #     "key-1": {
@@ -126,6 +129,35 @@ pool.snapshot() -> dict[str, dict[str, Any]]
 #     },
 #     ...
 # }
+```
+
+```python
+pool.stats() -> PoolStats
+# Lock-free metrics snapshot. Gauges describe current membership (expired
+# cooldowns report as healthy). Pool-level counters are process-lifetime and
+# survive remove(); per-resource counters are membership-scoped and start at 0
+# on add(). Never sum resource counters to rebuild pool counters -- that drops
+# on remove() and breaks Prometheus rate(). last_acquired_at is omitted on
+# purpose: it is process-monotonic, not a scrape timestamp.
+#
+# PoolStats
+#   resources: dict[str, ResourceStats]      # insertion order, current members
+#   in_flight: int                           # sum of current in_flight
+#   eligible: int                            # healthy and under max_in_flight
+#   saturated: int                           # healthy and at max_in_flight
+#   by_status: dict[status, int]             # always all three keys, zeros included
+#   attempts, successes, cooldowns, disables, sibling_cancels: int  # lifetime
+#   runs_ok, runs_exhausted, runs_error, runs_cancelled: int        # lifetime
+#
+# ResourceStats
+#   status, in_flight, max_in_flight, consecutive_cooldown,
+#   cooldown_seconds_remaining
+#   acquires, successes, cooldowns, disables, sibling_cancels
+#   eligible / saturated                     # derived bools
+#   max_in_flight_gauge                      # +Inf when max_in_flight is None
+#   status_one_hot()                         # {healthy: 0|1, cooling_down: ..., disabled: ...}
+#
+# PoolStats and ResourceStats are frozen dataclasses, exported from rotapool.
 ```
 
 ```python
@@ -155,7 +187,8 @@ await pool.disable(resource_id: str) -> None
 
 await pool.remove(resource_id: str) -> None
 # Drop a resource from the pool entirely -- the counterpart to add(). The
-# resource disappears from selection and snapshot() immediately, and the pool
+# resource disappears from selection, snapshot(), and stats().resources
+# immediately, and the pool
 # stops referencing its value (unlike disable(), which keeps it in memory --
 # remove is for rotated/revoked secrets). In-flight usages finish naturally,
 # exactly like admin disable(); a late CooldownResource from such a usage
@@ -217,6 +250,7 @@ raise CooldownResource(
 
     reason: str | None = None,
     # Free-form string surfaced in the exception message and logs.
+    # Not a metrics label -- stats() and PoolCollector do not export it.
 )
 ```
 
@@ -224,5 +258,72 @@ raise CooldownResource(
 raise DisableResource(
     reason: str | None = None,
     # Free-form string surfaced in the exception message and logs.
+    # Not a metrics label -- stats() and PoolCollector do not export it.
 )
 ```
+
+## `rotapool.prometheus.PoolCollector`
+
+Optional extra -- not a core dependency: `pip install "rotapool[prometheus]"`.
+Import from `rotapool.prometheus`, not `rotapool`. Register **one** collector
+per Prometheus registry; a second collector with the same metric names raises
+`ValueError`. Distinguish pools with the `pool` label.
+
+```python
+from prometheus_client import REGISTRY
+from rotapool.prometheus import PoolCollector
+
+# Single pool (pool_name defaults to "default"):
+REGISTRY.register(PoolCollector(pool, pool_name="api_keys"))
+
+# Several pools -- one collector, not two:
+REGISTRY.register(PoolCollector(pools={"api_keys": keys, "proxies": proxies}))
+
+# Or build it up:
+PoolCollector().add(keys, pool_name="api_keys").add(proxies, pool_name="proxies").register()
+```
+
+```python
+PoolCollector(
+    pool: Pool | None = None,          # Single pool. Mutually exclusive with pools.
+    *,
+    pool_name: str = "default",        # Value of the "pool" label for `pool`. Non-empty.
+                                       # Ignored when `pools` is given.
+    pools: dict[str, Pool] | None = None,  # pool label -> Pool
+)
+collector.add(pool, *, pool_name: str) -> PoolCollector
+# Attach another pool. Duplicate pool_name raises ValueError. Returns self.
+collector.register(registry=None) -> PoolCollector
+# Register on registry (default: prometheus_client.REGISTRY). Returns self.
+```
+
+Frozen metric names (changing them is a dashboard-breaking change):
+
+| Metric                                         | Kind                        | Labels                                                         |
+| ---------------------------------------------- | --------------------------- | -------------------------------------------------------------- |
+| `rotapool_runs_total`                          | counter                     | `pool`, `outcome` (`ok` / `exhausted` / `error` / `cancelled`) |
+| `rotapool_attempts_total`                      | counter                     | `pool`                                                         |
+| `rotapool_successes_total`                     | counter                     | `pool`                                                         |
+| `rotapool_cooldowns_total`                     | counter                     | `pool`                                                         |
+| `rotapool_disables_total`                      | counter                     | `pool`                                                         |
+| `rotapool_sibling_cancels_total`               | counter                     | `pool`                                                         |
+| `rotapool_in_flight`                           | gauge                       | `pool`                                                         |
+| `rotapool_eligible`                            | gauge                       | `pool`                                                         |
+| `rotapool_saturated`                           | gauge                       | `pool`                                                         |
+| `rotapool_resources`                           | gauge                       | `pool`, `status`                                               |
+| `rotapool_resource_status`                     | gauge (0/1 one-hot)         | `pool`, `resource_id`, `status`                                |
+| `rotapool_resource_in_flight`                  | gauge                       | `pool`, `resource_id`                                          |
+| `rotapool_resource_max_in_flight`              | gauge (`+Inf` if unbounded) | `pool`, `resource_id`                                          |
+| `rotapool_resource_consecutive_cooldown`       | gauge                       | `pool`, `resource_id`                                          |
+| `rotapool_resource_cooldown_remaining_seconds` | gauge                       | `pool`, `resource_id`                                          |
+| `rotapool_resource_acquires_total`             | counter                     | `pool`, `resource_id`                                          |
+| `rotapool_resource_successes_total`            | counter                     | `pool`, `resource_id`                                          |
+| `rotapool_resource_cooldowns_total`            | counter                     | `pool`, `resource_id`                                          |
+| `rotapool_resource_disables_total`             | counter                     | `pool`, `resource_id`                                          |
+| `rotapool_resource_sibling_cancels_total`      | counter                     | `pool`, `resource_id`                                          |
+
+Pool-level counters come from `stats()` lifetime totals, never from summing
+resource series. Resource series are current membership only. `last_acquired_at`
+is not exported.
+
+A runnable scrape is [`examples/prometheus_pool.py`](../examples/prometheus_pool.py).

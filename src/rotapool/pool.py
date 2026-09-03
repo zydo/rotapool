@@ -8,11 +8,11 @@ import math
 import random
 import time
 import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
-    Awaitable,
-    Callable,
     Generic,
     Literal,
     TypeVar,
@@ -35,7 +35,15 @@ else:
 
 
 from .exceptions import CooldownResource, DisableResource, PoolExhausted
-from .models import Resource, ResourceStatus, Usage
+from .models import (
+    RESOURCE_STATUSES,
+    PoolStats,
+    Resource,
+    ResourceStats,
+    ResourceStatus,
+    RunOutcome,
+    Usage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +53,36 @@ R = TypeVar("R")
 _DEFAULT_COOLDOWN_TABLE: tuple[float, ...] = (30.0, 120.0, 300.0, 600.0)
 
 Strategy = Literal["round_robin", "primary_backup"]
+
+
+@dataclass
+class _ResourceCounters:
+    """Per-resource monotonic counters. Lives on the pool, not on Resource.
+
+    Two pools may share Resource objects; mixing counters there would be wrong.
+    Membership-scoped: dropped on remove(), zeroed on a later add() of the same id.
+    """
+
+    acquires: int = 0
+    successes: int = 0
+    cooldowns: int = 0
+    disables: int = 0
+    sibling_cancels: int = 0
+
+
+@dataclass
+class _PoolCounters:
+    """Process-lifetime pool counters. Survive add()/remove(); never decrease."""
+
+    attempts: int = 0
+    successes: int = 0
+    cooldowns: int = 0
+    disables: int = 0
+    sibling_cancels: int = 0
+    runs_ok: int = 0
+    runs_exhausted: int = 0
+    runs_error: int = 0
+    runs_cancelled: int = 0
 
 
 class Pool(AgentReadableMixin, Generic[T]):
@@ -120,9 +158,10 @@ class Pool(AgentReadableMixin, Generic[T]):
 
             The hook is called synchronously while the pool lock is held: keep
             it fast, never block, and never call the pool's ``async`` methods
-            from it (``snapshot()`` is safe -- it is lock-free). An exception
-            raised by the hook is logged to the ``rotapool`` logger and
-            swallowed; monitoring must not break failover.
+            from it (``snapshot()`` and ``stats()`` are safe -- they are
+            lock-free). An exception raised by the hook is logged to the
+            ``rotapool`` logger and swallowed; monitoring must not break
+            failover. Do not use it as a metrics bus.
         """
         # resource_id -> resource
         self._resources: dict[str, Resource[T]] = self._build_resources(resources)
@@ -131,7 +170,7 @@ class Pool(AgentReadableMixin, Generic[T]):
 
         # `not >= 1` instead of `< 1`: also rejects NaN, which would otherwise
         # pass and surface later as `range(nan)` TypeError inside run().
-        if not max_attempts >= 1:
+        if not max_attempts >= 1:  # noqa: S1940
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
         self._max_attempts: int = max_attempts
 
@@ -155,6 +194,14 @@ class Pool(AgentReadableMixin, Generic[T]):
                 f"{type(on_state_change).__name__}"
             )
         self._on_state_change = on_state_change
+
+        # Monotonic counters live on the pool, not on Resource (two pools may
+        # share Resource objects). Resource counters are membership-scoped;
+        # pool counters survive remove().
+        self._pool_counters = _PoolCounters()
+        self._resource_counters: dict[str, _ResourceCounters] = {
+            rid: _ResourceCounters() for rid in self._resources
+        }
 
         # Guards all possibly racing states.
         self._lock: asyncio.Lock = asyncio.Lock()
@@ -245,15 +292,46 @@ class Pool(AgentReadableMixin, Generic[T]):
         # `not >=` instead of `<`: also rejects NaN, which would otherwise pass
         # and surface far from the bug -- retry_delay as a mid-retry ValueError
         # out of asyncio.sleep, max_attempts as `range(nan)` TypeError.
-        if max_attempts is not None and not max_attempts >= 1:
+        if max_attempts is not None and not max_attempts >= 1:  # noqa: S1940
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
-        if not retry_delay >= 0:
+        if not retry_delay >= 0:  # noqa: S1940
             raise ValueError(f"retry_delay must be >= 0, got {retry_delay}")
         if deadline is not None and not math.isfinite(deadline):
             raise ValueError(
                 f"deadline must be a finite time.monotonic() value, got {deadline}"
             )
         cap = max_attempts if max_attempts is not None else self._max_attempts
+        outcome: RunOutcome | None = None
+        try:
+            result = await self._run_attempts(
+                operation, rid, cap, deadline, retry_delay, wait_for_cooldown
+            )
+        except PoolExhausted:
+            outcome = "exhausted"
+            raise
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception:
+            outcome = "error"
+            raise
+        else:
+            outcome = "ok"
+            return result
+        finally:
+            if outcome is not None:
+                self._record_run_outcome(outcome)
+
+    async def _run_attempts(
+        self,
+        operation: Callable[[Resource[T]], Awaitable[R]],
+        rid: str,
+        cap: int,
+        deadline: float | None,
+        retry_delay: float,
+        wait_for_cooldown: bool,
+    ) -> R:
+        """Drive the retry loop. ``run()`` wraps this to record the outcome."""
         effective_attempts = min(cap, len(self._resources))
         if effective_attempts < 1:
             # Only reachable via remove() emptying the pool (construction
@@ -355,6 +433,18 @@ class Pool(AgentReadableMixin, Generic[T]):
             f"max_attempts={effective_attempts} exhausted: {last_error!r}"
         )
 
+    def _record_run_outcome(self, outcome: RunOutcome) -> None:
+        """Increment the matching pool-level run counter. GIL-atomic, no lock."""
+        c = self._pool_counters
+        if outcome == "ok":
+            c.runs_ok += 1
+        elif outcome == "exhausted":
+            c.runs_exhausted += 1
+        elif outcome == "error":
+            c.runs_error += 1
+        else:
+            c.runs_cancelled += 1
+
     def use(
         self,
         *,
@@ -397,21 +487,14 @@ class Pool(AgentReadableMixin, Generic[T]):
         Thread-safe without the lock -- iterates a copy of the resource dict
         (``add()`` can grow it from the event loop while another thread polls)
         and reads simple types (str, int, float) that change atomically under
-        the GIL. Good enough for metrics / /status.
+        the GIL. Operator / JSON view: includes ``last_acquired_at`` (a
+        ``time.monotonic()`` reading, not a scrape timestamp). For counters
+        and Prometheus-ready gauges, use :meth:`stats`.
         """
         now = time.monotonic()
         result: dict[str, dict[str, Any]] = {}
-        for rid, r in list(self._resources.items()):
-            inflight = len(self._inflight_by_resource.get(rid, set()))
-            # The stored status flips to "healthy" lazily inside _acquire, so an
-            # expired cooldown can linger as "cooling_down" on an idle pool. Report
-            # the effective status without mutating state (snapshot is lock-free).
-            status = r.status
-            if status == "cooling_down" and r.cooldown_until <= now:
-                status = "healthy"
-            cooldown_remaining = (
-                max(r.cooldown_until - now, 0.0) if status == "cooling_down" else 0.0
-            )
+        for rid, r in list(self._resources.items()):  # noqa: S7504
+            status, inflight, cooldown_remaining = self._resource_gauges(r, now)
             result[rid] = {
                 "status": status,
                 "in_flight": inflight,
@@ -421,6 +504,84 @@ class Pool(AgentReadableMixin, Generic[T]):
                 "last_acquired_at": r.last_acquired_at,
             }
         return result
+
+    def stats(self) -> PoolStats:
+        """Return Prometheus-ready gauges and monotonic counters.
+
+        Lock-free and thread-safe, same contract as :meth:`snapshot`. Gauges
+        describe current membership (expired cooldowns report as healthy).
+        Pool-level counters are process-lifetime and survive ``remove()``;
+        per-resource counters are membership-scoped and start at 0 on
+        ``add()``. Does not include ``last_acquired_at`` -- that value is
+        process-monotonic and is not a scrape timestamp.
+        """
+        now = time.monotonic()
+        resources: dict[str, ResourceStats] = {}
+        in_flight = 0
+        eligible = 0
+        saturated = 0
+        by_status: dict[ResourceStatus, int] = {s: 0 for s in RESOURCE_STATUSES}  # noqa: S7519
+        empty = _ResourceCounters()
+
+        for rid, r in list(self._resources.items()):  # noqa: S7504
+            status, inflight, cooldown_remaining = self._resource_gauges(r, now)
+            c = self._resource_counters.get(rid, empty)
+            rs = ResourceStats(
+                resource_id=rid,
+                status=status,
+                in_flight=inflight,
+                max_in_flight=r.max_in_flight,
+                consecutive_cooldown=r.consecutive_cooldown,
+                cooldown_seconds_remaining=cooldown_remaining,
+                acquires=c.acquires,
+                successes=c.successes,
+                cooldowns=c.cooldowns,
+                disables=c.disables,
+                sibling_cancels=c.sibling_cancels,
+            )
+            resources[rid] = rs
+            in_flight += inflight
+            by_status[status] += 1
+            if rs.eligible:
+                eligible += 1
+            if rs.saturated:
+                saturated += 1
+
+        pc = self._pool_counters
+        return PoolStats(
+            resources=resources,
+            in_flight=in_flight,
+            eligible=eligible,
+            saturated=saturated,
+            by_status=by_status,
+            attempts=pc.attempts,
+            successes=pc.successes,
+            cooldowns=pc.cooldowns,
+            disables=pc.disables,
+            sibling_cancels=pc.sibling_cancels,
+            runs_ok=pc.runs_ok,
+            runs_exhausted=pc.runs_exhausted,
+            runs_error=pc.runs_error,
+            runs_cancelled=pc.runs_cancelled,
+        )
+
+    def _resource_gauges(
+        self, r: Resource[T], now: float
+    ) -> tuple[ResourceStatus, int, float]:
+        """Effective status, in-flight count, and cooldown remaining.
+
+        The stored status flips to ``healthy`` lazily inside ``_acquire``, so an
+        expired cooldown can linger as ``cooling_down`` on an idle pool. Report
+        the effective status without mutating state (callers are lock-free).
+        """
+        inflight = len(self._inflight_by_resource.get(r.resource_id, set()))
+        status = r.status
+        if status == "cooling_down" and r.cooldown_until <= now:
+            status = "healthy"
+        cooldown_remaining = (
+            max(r.cooldown_until - now, 0.0) if status == "cooling_down" else 0.0
+        )
+        return status, inflight, cooldown_remaining
 
     async def add(
         self,
@@ -452,6 +613,9 @@ class Pool(AgentReadableMixin, Generic[T]):
         async with self._admin_changed:
             if resource.resource_id in self._resources:
                 raise ValueError(f"Duplicate resource_id in pool: {resource_id!r}")
+            # Counters first so a lock-free stats() that sees the new resource
+            # never observes a missing counter dict entry.
+            self._resource_counters[resource.resource_id] = _ResourceCounters()
             self._resources[resource.resource_id] = resource
             self._admin_changed.notify_all()
         return resource
@@ -497,9 +661,10 @@ class Pool(AgentReadableMixin, Generic[T]):
     async def remove(self, resource_id: str) -> None:
         """Drop a resource from the pool entirely -- the counterpart to ``add()``.
 
-        The resource disappears from selection and ``snapshot()`` immediately,
-        and the pool stops referencing its ``value`` -- unlike ``disable()``,
-        which keeps the (often secret) value in memory. In-flight usages
+        The resource disappears from selection, ``snapshot()``, and
+        ``stats().resources`` immediately, and the pool stops referencing its
+        ``value`` -- unlike ``disable()``, which keeps the (often secret) value
+        in memory. In-flight usages
         acquired before removal finish naturally, exactly like admin
         ``disable()``: removal is policy, not failure evidence, so running work
         that may already have upstream side effects is never cancelled. Their
@@ -523,7 +688,11 @@ class Pool(AgentReadableMixin, Generic[T]):
         """
         async with self._admin_changed:
             self._get_resource(resource_id)
+            # Drop the resource first so stats() membership is the source of
+            # truth; a racy stats() may briefly see zeros for a still-listed
+            # id, never a ghost series for a removed one.
             del self._resources[resource_id]
+            self._resource_counters.pop(resource_id, None)
             self._admin_changed.notify_all()
 
     def _get_resource(self, resource_id: str) -> Resource[T]:
@@ -545,6 +714,11 @@ class Pool(AgentReadableMixin, Generic[T]):
         if old_status == new_status:
             return
         resource.status = new_status
+        if new_status == "disabled":
+            self._pool_counters.disables += 1
+            rc = self._resource_counters.get(resource.resource_id)
+            if rc is not None:
+                rc.disables += 1
         self._notify_state_change_locked(resource.resource_id, old_status, new_status)
 
     def _notify_state_change_locked(
@@ -630,6 +804,10 @@ class Pool(AgentReadableMixin, Generic[T]):
                 )
             selected.last_acquired_at = now
             self._next_acquisition_order += 1
+            self._pool_counters.attempts += 1
+            rc = self._resource_counters.get(selected.resource_id)
+            if rc is not None:
+                rc.acquires += 1
             usage = Usage(
                 usage_id=str(uuid.uuid4()),
                 request_id=request_id,
@@ -714,6 +892,10 @@ class Pool(AgentReadableMixin, Generic[T]):
         """
         async with self._lock:
             usage.status = "done"
+            self._pool_counters.successes += 1
+            rc = self._resource_counters.get(usage.resource_id)
+            if rc is not None:
+                rc.successes += 1
             resource = self._resources.get(usage.resource_id)
             if resource is not None and resource.status == "healthy":
                 resource.cooldown_until = 0.0
@@ -757,7 +939,17 @@ class Pool(AgentReadableMixin, Generic[T]):
                 resource.resource_id, old_status, "cooling_down"
             )
 
+            self._pool_counters.cooldowns += 1
+            rc = self._resource_counters.get(resource.resource_id)
+            if rc is not None:
+                rc.cooldowns += 1
+
             to_cancel = self._collect_younger_usages_locked(usage)
+            n_cancel = len(to_cancel)
+            if n_cancel:
+                self._pool_counters.sibling_cancels += n_cancel
+                if rc is not None:
+                    rc.sibling_cancels += n_cancel
 
         self._cancel_tasks(to_cancel)
 
@@ -777,6 +969,12 @@ class Pool(AgentReadableMixin, Generic[T]):
                 self._set_resource_status_locked(resource, "disabled")
 
             to_cancel = self._collect_younger_usages_locked(usage)
+            n_cancel = len(to_cancel)
+            if n_cancel:
+                self._pool_counters.sibling_cancels += n_cancel
+                rc = self._resource_counters.get(usage.resource_id)
+                if rc is not None:
+                    rc.sibling_cancels += n_cancel
 
         self._cancel_tasks(to_cancel)
 
@@ -916,28 +1114,48 @@ append to pool order, so they are the lowest-priority fallback under
 ``primary_backup`` unless earlier resources are unavailable.
 
 ``await pool.remove(resource_id)`` is the counterpart: the resource and its
-value leave selection and ``snapshot()`` entirely (``disable()`` keeps the
-value in memory -- remove is for rotated/revoked secrets). In-flight usages
-drain naturally, like admin disable. Raises ``KeyError`` for unknown ids.
+value leave selection, ``snapshot()``, and ``stats().resources`` entirely
+(``disable()`` keeps the value in memory -- remove is for rotated/revoked
+secrets). In-flight usages drain naturally, like admin disable. Raises
+``KeyError`` for unknown ids.
 
-### Observability: on_state_change
+### Observability: snapshot, stats, on_state_change
 
-``snapshot()`` is poll-based. For push notifications, pass a callback to the
-constructor:
+Three surfaces -- pick the right one:
+
+- ``snapshot()`` -- operator/JSON view. Includes process-monotonic
+  ``last_acquired_at`` (not a scrape timestamp) and has **no counters**.
+- ``stats()`` -- metrics view. Returns a ``PoolStats`` (do not construct one).
+  Numeric gauges, ``status_one_hot()`` / ``max_in_flight_gauge`` (``+Inf`` if
+  unbounded), plus monotonic counters. Pool-level counters survive
+  ``remove()``; per-resource counters live on each ``ResourceStats`` and
+  reset on re-``add()`` of the same id.
+- ``on_state_change`` -- push hook for health flips, not a metrics bus.
 
 ```python
-events: list[tuple[str, str, str]] = []
-pool = Pool(
-    resources,
-    on_state_change=lambda rid, old, new: events.append((rid, old, new)),
-)
+from rotapool import Pool, PoolStats  # PoolStats is the stats() return type
+
+s = pool.stats()
+s.by_status["healthy"]          # gauge, always all three status keys
+s.eligible, s.saturated         # derived gauges
+s.runs_ok, s.runs_exhausted, s.runs_error, s.runs_cancelled
+s.resources["key-a"].acquires   # membership-scoped counter
+s.resources["key-a"].status_one_hot()
 ```
 
-It fires on cooldown events (escalations arrive as ``cooling_down ->
-cooling_down``), disables (signal or admin), admin enables, and cooldown
-expiry at selection time -- not on ``add()`` / ``remove()``, success resets,
-or no-op admin calls. It runs synchronously under the pool lock: keep it fast;
-exceptions are logged to the ``rotapool`` logger and swallowed.
+Optional Prometheus extra (``pip install "rotapool[prometheus]"``) -- not a
+core dependency. Import ``PoolCollector`` from ``rotapool.prometheus``,
+**not** from ``rotapool``:
+
+```python
+from prometheus_client import REGISTRY
+from rotapool.prometheus import PoolCollector
+REGISTRY.register(PoolCollector(pool, pool_name="api_keys"))
+```
+
+One ``PoolCollector`` per registry (a second collides on metric names); pass
+``pools={"a": p1, "b": p2}`` or ``add()`` for several pools. Frozen names
+are in ``rotapool.prometheus``. For any other backend, scrape ``stats()``.
 
 ### Anti-pattern: doing the real work OUTSIDE ``run()``
 
@@ -981,6 +1199,15 @@ N ``run()`` invocations.
   resource and its value entirely while in-flight work drains).
 - Share one ``Pool`` across asyncio event loops -- the lock binds to the loop
   where it was first awaited.
+- Scrape ``snapshot()`` for Prometheus / rates -- it has no counters and
+  ``last_acquired_at`` is process-monotonic. Use ``stats()``.
+- Construct ``PoolStats`` / ``ResourceStats`` -- call ``stats()``.
+- Sum per-resource counters to rebuild pool totals -- that drops on
+  ``remove()`` and breaks ``rate()``.
+- Register two ``PoolCollector`` instances on one registry, or import
+  ``PoolCollector`` from ``rotapool`` (it lives in ``rotapool.prometheus``).
+- Increment counters from ``on_state_change`` -- it runs under the lock and
+  misses success, exhaustion, retries, and membership.
 
 ### Gotcha
 

@@ -4,11 +4,11 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "agent-readable"
-version = "0.2.0"
+version = "0.3.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/42/c6/33108f4418375d796f5b4f409a530f6b0b5561f021ddca7d2c8673814def/agent_readable-0.2.0.tar.gz", hash = "sha256:bf4213278b9eb695e22a3221aede3979306d7d5888be35c0dcbe2c4b931625b3", size = 51151307, upload-time = "2026-06-08T09:39:44.949Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7c/58/5874285dbf2e7c245adb1c098240747719bd4e4b6eabe6e4871b99207b22/agent_readable-0.3.1.tar.gz", hash = "sha256:a8197711e9bddd99f982aadb9b2e9909ed8c42a2698d8063cd872cb55af47e66", size = 51159753, upload-time = "2026-08-23T12:28:34.14Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/3e/60dbe3cf7fee01e985a4d5cf5dce58ccd49f0672ec695dfae221ca7844c5/agent_readable-0.2.0-py3-none-any.whl", hash = "sha256:a328a7a498c38b3cc96d31e50d9f2747a2a44730996757cf893b2b149b01d6f5", size = 18717, upload-time = "2026-06-08T09:39:43.259Z" },
+    { url = "https://files.pythonhosted.org/packages/66/cc/ff082592de3bc8f0da9087555c60fc618d5e1dc2d9fcc0250fb055ede74c/agent_readable-0.3.1-py3-none-any.whl", hash = "sha256:6126082d0f0723cc336a4bcd32d6f5d37629f1d6732d16adef3883a7ca2ea42d", size = 13563, upload-time = "2026-08-23T12:28:31.692Z" },
 ]
 
 [[package]]
@@ -152,7 +152,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -193,6 +193,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.26.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/52/73/f1334c29c2af4cd9dba6c7817e61b611bd0215e2eb5565c6064a4de18802/prometheus_client-0.26.0.tar.gz", hash = "sha256:04a91bcf94e2cf74a44a1a874d651a2e853ed354b6e822f3b7487751465d5c2b", size = 92910, upload-time = "2026-07-24T19:36:41.893Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/eb/a3/b69efbf4143b5b9859b977770bbbabcc2796b702fa69dc40271e45cd5a56/prometheus_client-0.26.0-py3-none-any.whl", hash = "sha256:fa93d06737aa02bacd05794768508bb97d2fbee28cb3bca04eaae92f0ca953d6", size = 64494, upload-time = "2026-07-24T19:36:40.854Z" },
 ]
 
 [[package]]
@@ -265,16 +274,20 @@ wheels = [
 
 [[package]]
 name = "rotapool"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
 agent = [
     { name = "agent-readable" },
 ]
+prometheus = [
+    { name = "prometheus-client" },
+]
 
 [package.dev-dependencies]
 dev = [
+    { name = "prometheus-client" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -283,11 +296,15 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "agent-readable", marker = "extra == 'agent'", specifier = ">=0.2.0" }]
-provides-extras = ["agent"]
+requires-dist = [
+    { name = "agent-readable", marker = "extra == 'agent'", specifier = ">=0.3.1" },
+    { name = "prometheus-client", marker = "extra == 'prometheus'", specifier = ">=0.17" },
+]
+provides-extras = ["agent", "prometheus"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "prometheus-client", specifier = ">=0.17" },
     { name = "pyright", specifier = "==1.1.411" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.23" },

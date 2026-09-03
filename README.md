@@ -7,11 +7,11 @@ Async resource pool with inline health feedback, automatic cooldown, and retry -
 
 `rotapool` is designed for resources where every call is also useful health evidence. Instead of relying on a separate prober, callers signal whether the selected resource should stay healthy, cool down temporarily, or be disabled.
 
-| Signal                              | Meaning                                 |
-| ----------------------------------- | --------------------------------------- |
-| normal return / any other exception | Resource is healthy                     |
-| `CooldownResource`                  | Temporarily overloaded, e.g. HTTP 429   |
-| `DisableResource`                   | Permanently unusable, e.g. revoked key  |
+| Signal                              | Meaning                                |
+| ----------------------------------- | -------------------------------------- |
+| normal return / any other exception | Resource is healthy                    |
+| `CooldownResource`                  | Temporarily overloaded, e.g. HTTP 429  |
+| `DisableResource`                   | Permanently unusable, e.g. revoked key |
 
 > **Designed for AI coding agents.** `rotapool` exposes machine-readable usage notes via [agent-readable](https://github.com/zydo/agent-readable), including operation contracts, do/don't rules, anti-patterns, and failure modes.
 >
@@ -27,7 +27,7 @@ pip install rotapool
 uv add rotapool
 ```
 
-Requires Python 3.10+. Zero runtime dependencies; `pip install "rotapool[agent]"` adds the optional [agent-readable](https://github.com/zydo/agent-readable) integration.
+Requires Python 3.10+. Zero runtime dependencies. Optional extras: `pip install "rotapool[agent]"` for [agent-readable](https://github.com/zydo/agent-readable), `pip install "rotapool[prometheus]"` for a Prometheus collector over `pool.stats()`. A runnable scrape is in [`examples/prometheus_pool.py`](examples/prometheus_pool.py).
 
 ## Quick Start
 
@@ -65,12 +65,16 @@ async def call_upstream(resource, url, payload):
 result = await call_upstream("https://api.example.com/v1/chat", {"prompt": "hi"})
 ```
 
+Runnable versions of this (no httpx) and of the Prometheus extra live in [`examples/`](examples/).
+
 ## Documentation
 
-- [Usage guide](docs/usage.md) covers pool initialization, `@pool.use()`, direct `pool.run()`, resource types, and accepted operation shapes.
-- [Behavior guide](docs/behavior.md) explains selection strategies, cooldown escalation, retry behavior, in-flight cancellation, cancellation discrimination, and admin control.
-- [API reference](docs/api.md) documents `Pool`, `Resource`, `snapshot()`, admin methods, and exceptions.
+- [Usage guide](docs/usage.md) covers pool initialization, `@pool.use()`, direct `pool.run()`, resource types, accepted operation shapes, and observability.
+- [Behavior guide](docs/behavior.md) explains selection strategies, cooldown escalation, retry behavior, in-flight cancellation, cancellation discrimination, admin control, and metrics (`snapshot()`, `stats()`, optional Prometheus collector).
+- [API reference](docs/api.md) documents `Pool`, `Resource`, `snapshot()`, `stats()`, admin methods, exceptions, and the optional Prometheus collector.
 - [Pitfalls and testing](docs/pitfalls-and-testing.md) lists common anti-patterns, cancellation gotchas, test commands, and license information.
+- [Changelog](CHANGELOG.md) lists released versions.
+- [`examples/`](examples/) has runnable scripts: `basic_usage.py` (`use()` / `run()`), `prometheus_pool.py` (optional scrape).
 
 ## Core Concepts
 

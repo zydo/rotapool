@@ -24,24 +24,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from collections import Counter
-from typing import (
-    Any,
-    Awaitable,
-    Callable,
-    Coroutine,
-    Generator,
-    Generic,
-    TypeVar,
-    cast,
-)
+from collections.abc import Awaitable, Callable, Coroutine, Generator
+from typing import Any, Generic, TypeVar, cast
 
 import pytest
 
-from rotapool import CooldownResource, DisableResource, Pool, PoolExhausted, Resource
-from rotapool.models import Usage
+from rotapool import (
+    CooldownResource,
+    DisableResource,
+    Pool,
+    PoolExhausted,
+    PoolStats,
+    Resource,
+    ResourceStats,
+)
+from rotapool.models import RESOURCE_STATUSES, Usage
 
 FAST_TABLE = (0.05, 0.10, 0.15, 0.20)
 
@@ -160,6 +161,10 @@ class Ops:
 
 def _res(n: int, **kw: Any) -> list[Resource[str]]:
     return [Resource(resource_id=f"r{i}", value=f"v{i}", **kw) for i in range(n)]
+
+
+async def _never(_: Resource[str]) -> Any:
+    await asyncio.Event().wait()
 
 
 @pytest.fixture(params=["coroutine", "awaitable", "future"])
@@ -1941,3 +1946,407 @@ class TestStateChangeHook:
         assert not failures
         assert polls > 0
         assert len(pool.snapshot()) == 51
+
+
+# ===================================================================
+# Group N — stats()
+# ===================================================================
+
+
+class TestStats:
+    def test_n1_schema_and_prometheus_ready_gauges(self) -> None:
+        """stats() types, stable by_status keys, one-hot status, +Inf cap."""
+        pool = Pool(resources=_res(2, max_in_flight=4), cooldown_table=FAST_TABLE)
+        s = pool.stats()
+        assert isinstance(s, PoolStats)
+        assert set(s.by_status) == set(RESOURCE_STATUSES)
+        assert s.by_status["healthy"] == 2
+        assert s.by_status["cooling_down"] == 0
+        assert s.by_status["disabled"] == 0
+        assert s.in_flight == 0
+        assert s.eligible == 2
+        assert s.saturated == 0
+        assert s.attempts == s.successes == s.cooldowns == s.disables == 0
+        assert s.sibling_cancels == 0
+        assert s.runs_ok == s.runs_exhausted == s.runs_error == s.runs_cancelled == 0
+
+        rs = s.resources["r0"]
+        assert isinstance(rs, ResourceStats)
+        assert rs.status == "healthy"
+        assert rs.in_flight == 0
+        assert rs.max_in_flight == 4
+        assert rs.max_in_flight_gauge == 4.0
+        assert rs.consecutive_cooldown == 0
+        assert rs.cooldown_seconds_remaining == 0.0
+        assert rs.acquires == rs.successes == rs.cooldowns == rs.disables == 0
+        assert rs.sibling_cancels == 0
+        assert rs.eligible is True
+        assert rs.saturated is False
+        assert rs.status_one_hot() == {
+            "healthy": 1,
+            "cooling_down": 0,
+            "disabled": 0,
+        }
+        assert not hasattr(rs, "last_acquired_at")
+
+        unlimited = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        cap = unlimited.stats().resources["r0"].max_in_flight_gauge
+        assert cap == float("inf")
+
+    async def test_n2_gauges_match_snapshot(self) -> None:
+        """stats() resource gauges agree with snapshot(), minus last_acquired_at."""
+        pool = Pool(resources=_res(1, max_in_flight=2), cooldown_table=FAST_TABLE)
+
+        async def cool(_: Resource[str]) -> None:
+            raise CooldownResource(reason="hot")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cool, max_attempts=1)
+
+        snap = pool.snapshot()["r0"]
+        rs = pool.stats().resources["r0"]
+        assert rs.status == snap["status"] == "cooling_down"
+        assert rs.in_flight == snap["in_flight"]
+        assert rs.max_in_flight == snap["max_in_flight"]
+        assert rs.consecutive_cooldown == snap["consecutive_cooldown"]
+        assert rs.cooldown_seconds_remaining > 0
+        assert snap["cooldown_seconds_remaining"] > 0
+
+    async def test_n3_expired_cooldown_reports_healthy(self) -> None:
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        async def cool(_: Resource[str]) -> None:
+            raise CooldownResource(reason="hot")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cool, max_attempts=1)
+        await asyncio.sleep(FAST_TABLE[0] + 0.05)
+
+        s = pool.stats()
+        assert s.resources["r0"].status == "healthy"
+        assert s.resources["r0"].cooldown_seconds_remaining == 0.0
+        assert s.by_status["healthy"] == 1
+        assert s.by_status["cooling_down"] == 0
+        assert s.eligible == 1
+
+    async def test_n4_eligible_and_saturated(self) -> None:
+        pool = Pool(
+            resources=_res(1, max_in_flight=1),
+            cooldown_table=FAST_TABLE,
+        )
+        release = asyncio.Event()
+
+        async def hold(r: Resource[str]) -> str:
+            await release.wait()
+            return r.value
+
+        task = asyncio.create_task(pool.run(hold))
+        await asyncio.sleep(0.05)
+        try:
+            s = pool.stats()
+            assert s.in_flight == 1
+            assert s.saturated == 1
+            assert s.eligible == 0
+            assert s.resources["r0"].saturated is True
+            assert s.resources["r0"].eligible is False
+        finally:
+            release.set()
+            assert await task == "v0"
+
+        s = pool.stats()
+        assert s.in_flight == 0
+        assert s.saturated == 0
+        assert s.eligible == 1
+
+    async def test_n5_run_ok_increments(self, ops: Ops) -> None:
+        pool = Pool(resources=_res(2), cooldown_table=FAST_TABLE)
+        assert await pool.run(ops.identity()) == "v0"
+        s = pool.stats()
+        assert s.runs_ok == 1
+        assert s.runs_exhausted == s.runs_error == s.runs_cancelled == 0
+        assert s.attempts == 1
+        assert s.successes == 1
+        assert s.resources["r0"].acquires == 1
+        assert s.resources["r0"].successes == 1
+        assert s.resources["r1"].acquires == 0
+
+    async def test_n6_exhausted_and_cooldown_counters(self) -> None:
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        async def cool(_: Resource[str]) -> None:
+            raise CooldownResource(reason="hot")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cool, max_attempts=1)
+
+        s = pool.stats()
+        assert s.runs_exhausted == 1
+        assert s.runs_ok == 0
+        assert s.attempts == 1
+        assert s.cooldowns == 1
+        assert s.successes == 0
+        assert s.resources["r0"].cooldowns == 1
+        assert s.resources["r0"].acquires == 1
+        assert s.by_status["cooling_down"] == 1
+        assert s.eligible == 0
+
+    async def test_n7_business_error_is_runs_error_and_success(self) -> None:
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        async def boom(_: Resource[str]) -> None:
+            raise RuntimeError("business")
+
+        with pytest.raises(RuntimeError, match="business"):
+            await pool.run(boom)
+
+        s = pool.stats()
+        assert s.runs_error == 1
+        assert s.runs_ok == s.runs_exhausted == 0
+        assert s.successes == 1
+        assert s.resources["r0"].successes == 1
+        assert s.cooldowns == 0
+
+    async def test_n8_outer_cancel_is_runs_cancelled(self) -> None:
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        task = asyncio.create_task(pool.run(_never))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        s = pool.stats()
+        assert s.runs_cancelled == 1
+        assert s.runs_ok == s.runs_exhausted == s.runs_error == 0
+        assert s.attempts == 1
+        assert s.successes == 0
+
+    async def test_n9_escalation_counts_each_cooldown(self) -> None:
+        """cooling_down -> cooling_down is still a cooldown event."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        older_release = asyncio.Event()
+        younger_release = asyncio.Event()
+
+        async def older(_: Resource[str]) -> str:
+            await older_release.wait()
+            raise CooldownResource(reason="older")
+
+        async def younger(_: Resource[str]) -> str:
+            await younger_release.wait()
+            raise CooldownResource(reason="younger")
+
+        older_task = asyncio.create_task(pool.run(older, max_attempts=1))
+        await asyncio.sleep(0.02)
+        younger_task = asyncio.create_task(pool.run(younger, max_attempts=1))
+        await asyncio.sleep(0.02)
+        younger_release.set()
+        await asyncio.sleep(0.02)
+        older_release.set()
+        with pytest.raises(PoolExhausted):
+            await younger_task
+        with pytest.raises(PoolExhausted):
+            await older_task
+
+        s = pool.stats()
+        assert s.cooldowns == 2
+        assert s.resources["r0"].cooldowns == 2
+        assert s.runs_exhausted == 2
+
+    async def test_n10_disable_signal_and_admin_idempotent(self) -> None:
+        pool = Pool(resources=_res(2), cooldown_table=FAST_TABLE)
+
+        async def breaker(_: Resource[str]) -> None:
+            raise DisableResource(reason="dead")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(breaker, max_attempts=1)
+        await pool.disable("r1")
+        await pool.disable("r0")  # already disabled
+        await pool.disable("r1")  # already disabled
+
+        s = pool.stats()
+        assert s.disables == 2
+        assert s.resources["r0"].disables == 1
+        assert s.resources["r1"].disables == 1
+        assert s.by_status["disabled"] == 2
+        assert s.eligible == 0
+
+    async def test_n11_sibling_cancels(self) -> None:
+        pool = Pool(resources=_res(1), max_attempts=3, cooldown_table=FAST_TABLE)
+        oldest_started = asyncio.Event()
+        middle_started = asyncio.Event()
+
+        async def oldest(_: Resource[str]) -> str:
+            oldest_started.set()
+            await middle_started.wait()
+            await asyncio.sleep(0.2)
+            return "oldest-ok"
+
+        async def middle(_: Resource[str]) -> None:
+            middle_started.set()
+            await asyncio.sleep(0.03)
+            raise CooldownResource(cooldown_seconds=10.0, reason="hot")
+
+        async def youngest(_: Resource[str]) -> str:
+            try:
+                await asyncio.sleep(1.0)
+                return "youngest-ok"
+            except asyncio.CancelledError:
+                raise
+
+        oldest_task = asyncio.create_task(pool.run(oldest))
+        await oldest_started.wait()
+        middle_task = asyncio.create_task(pool.run(middle))
+        await middle_started.wait()
+        youngest_task = asyncio.create_task(pool.run(youngest))
+        await asyncio.sleep(0.01)
+
+        assert await oldest_task == "oldest-ok"
+        with pytest.raises((PoolExhausted, asyncio.CancelledError)):
+            await middle_task
+        with pytest.raises((PoolExhausted, asyncio.CancelledError)):
+            await youngest_task
+
+        s = pool.stats()
+        assert s.sibling_cancels == 1
+        assert s.resources["r0"].sibling_cancels == 1
+        assert s.cooldowns == 1
+
+    async def test_n15_disable_sibling_cancels(self) -> None:
+        pool = Pool(resources=_res(1), max_attempts=3, cooldown_table=FAST_TABLE)
+        oldest_started = asyncio.Event()
+        middle_started = asyncio.Event()
+
+        async def oldest(_: Resource[str]) -> str:
+            oldest_started.set()
+            await middle_started.wait()
+            await asyncio.sleep(0.2)
+            return "oldest-ok"
+
+        async def middle(_: Resource[str]) -> None:
+            middle_started.set()
+            await asyncio.sleep(0.03)
+            raise DisableResource(reason="dead")
+
+        async def youngest(_: Resource[str]) -> str:
+            await asyncio.sleep(1.0)
+            return "youngest-ok"
+
+        oldest_task = asyncio.create_task(pool.run(oldest))
+        await oldest_started.wait()
+        middle_task = asyncio.create_task(pool.run(middle))
+        await middle_started.wait()
+        youngest_task = asyncio.create_task(pool.run(youngest))
+        await asyncio.sleep(0.01)
+
+        assert await oldest_task == "oldest-ok"
+        with pytest.raises((PoolExhausted, asyncio.CancelledError)):
+            await middle_task
+        with pytest.raises((PoolExhausted, asyncio.CancelledError)):
+            await youngest_task
+
+        s = pool.stats()
+        assert s.sibling_cancels == 1
+        assert s.resources["r0"].sibling_cancels == 1
+        assert s.disables == 1
+
+    async def test_n12_remove_drops_resource_keeps_pool_counters(self) -> None:
+        pool = Pool(resources=_res(2), cooldown_table=FAST_TABLE)
+
+        async def cool(_: Resource[str]) -> None:
+            raise CooldownResource(reason="hot")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cool, max_attempts=1)
+        assert pool.stats().cooldowns == 1
+        assert "r0" in pool.stats().resources
+
+        await pool.remove("r0")
+        s = pool.stats()
+        assert "r0" not in s.resources
+        assert s.cooldowns == 1  # lifetime, not rebuilt from membership
+        assert s.attempts == 1
+        assert s.runs_exhausted == 1
+        assert set(s.resources) == {"r1"}
+        assert s.by_status["healthy"] == 1
+
+        await pool.add("r0", "v0-new")
+        rs = pool.stats().resources["r0"]
+        assert rs.acquires == 0
+        assert rs.cooldowns == 0
+        assert pool.stats().cooldowns == 1
+
+    async def test_n13_validation_error_does_not_count(self) -> None:
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+
+        async def ok(r: Resource[str]) -> str:
+            return r.value
+
+        with pytest.raises(ValueError):
+            await pool.run(ok, max_attempts=0)
+        s = pool.stats()
+        assert s.runs_ok == s.runs_error == s.runs_exhausted == 0
+        assert s.attempts == 0
+
+    async def test_n14_stats_survives_concurrent_add(self) -> None:
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        stop = threading.Event()
+        failures: list[str] = []
+        polls = 0
+
+        def poll() -> None:
+            nonlocal polls
+            while not stop.is_set():
+                try:
+                    pool.stats()
+                    polls += 1
+                except RuntimeError as e:  # pragma: no cover
+                    failures.append(str(e))
+
+        poller = threading.Thread(target=poll)
+        poller.start()
+        try:
+            for i in range(50):
+                await pool.add(f"x{i}", f"v{i}")
+        finally:
+            stop.set()
+            poller.join()
+
+        assert not failures
+        assert polls > 0
+        assert len(pool.stats().resources) == 51
+
+    def test_n16_agent_notes_cover_stats_and_real_members(self) -> None:
+        """Agents inspecting Pool / PoolStats / ResourceStats are told to
+        scrape stats(), not construct the dataclasses or poll snapshot()."""
+        pool_notes = Pool.__agent_notes__()
+        assert "stats()" in pool_notes
+        assert "PoolCollector" in pool_notes
+        assert "rotapool.prometheus" in pool_notes
+        assert "snapshot()" in pool_notes
+        assert "last_acquired_at" in pool_notes
+
+        known = {
+            "run",
+            "use",
+            "add",
+            "enable",
+            "disable",
+            "remove",
+            "snapshot",
+            "stats",
+            "status_one_hot",  # ResourceStats
+        }
+        for name in re.findall(r"`(\w+)\(\)`", pool_notes):
+            if name in known:
+                if name == "status_one_hot":
+                    assert hasattr(ResourceStats, name)
+                else:
+                    assert hasattr(Pool, name), name
+
+        stats_notes = PoolStats.__agent_notes__()
+        assert "Do not construct" in stats_notes
+        assert "pool.stats()" in stats_notes
+
+        rs_notes = ResourceStats.__agent_notes__()
+        assert "Do not construct" in rs_notes
+        assert "status_one_hot()" in rs_notes
+        assert "max_in_flight_gauge" in rs_notes

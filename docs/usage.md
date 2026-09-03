@@ -24,7 +24,7 @@ pool = Pool(
     # A list of Resource objects, or a dict whose keys match each resource_id.
     resources=[
         Resource(
-            resource_id="key-1",                 # Unique identifier (used in logs, metrics, snapshot)
+            resource_id="key-1",                 # Unique identifier (used in logs, snapshot, stats)
             value="sk-aaa",                      # The actual resource value (generic type T)
             # max_in_flight=None,                # Max concurrent usages per resource (None = unlimited)
         ),
@@ -69,6 +69,8 @@ async def call_upstream(resource, url, payload):
 # Call it -- the framework picks the best key and retries on failure.
 result = await call_upstream("https://api.example.com/v1/chat", {"prompt": "hi"})
 ```
+
+A script that runs both this decorator and `pool.run()` without httpx is [`examples/basic_usage.py`](../examples/basic_usage.py).
 
 ## Option 2: Direct `run()`
 
@@ -154,3 +156,26 @@ def call_in_thread(resource, payload):
 ```
 
 A callable that returns a non-Awaitable, such as a plain `int`, raises `TypeError` at call time. The resource is marked healthy because this is your bug, not the resource's, and the error propagates to the caller.
+
+## Observability
+
+`snapshot()` is the operator view of current resource state. `stats()` is the metrics view: Prometheus-ready gauges plus monotonic counters (`runs_ok` / `runs_exhausted` / `runs_error` / `runs_cancelled`, per-resource `acquires` / `cooldowns` / ...).
+
+```python
+s = pool.stats()
+print(s.by_status, s.eligible, s.runs_exhausted)
+print(s.resources["key-1"].status_one_hot())
+```
+
+To expose the pool to Prometheus (`pip install "rotapool[prometheus]"` -- not a core dependency):
+
+```python
+from prometheus_client import REGISTRY
+from rotapool.prometheus import PoolCollector
+
+REGISTRY.register(PoolCollector(pool, pool_name="api_keys"))
+```
+
+Register one collector per registry; pass `pools={...}` when you have several pools (do not register two collectors). Frozen metric names are listed in the [API reference](api.md#rotapoolprometheuspoolcollector). Or scrape `stats()` yourself. See the [behavior guide](behavior.md#observability) for what is counted and what is not.
+
+A runnable walkthrough (HTTP `/metrics` or a one-shot dump) is [`examples/prometheus_pool.py`](../examples/prometheus_pool.py).

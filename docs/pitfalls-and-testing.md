@@ -28,7 +28,7 @@ Return only plain values, such as bytes, dicts, or dataclasses, from operations.
 
 - **Don't raise `CooldownResource` for business errors** such as 404 or validation failures. The next resource will return the same error and burn the retry budget for nothing -- these belong in normal exceptions or return values.
 - **Don't catch and swallow exceptions inside the operation.** The pool needs to see `CooldownResource` / `DisableResource` to update health; swallowing them turns rate limits into invisible successes.
-- **Don't mutate `Resource` fields from outside the pool.** `status`, `cooldown_until`, `last_acquired_at`, and `consecutive_cooldown` are framework-owned lifecycle state. For administrative control, use `await pool.add(id, value)` / `await pool.enable(id)` / `await pool.disable(id)` instead.
+- **Don't mutate `Resource` fields from outside the pool.** `status`, `cooldown_until`, `last_acquired_at`, and `consecutive_cooldown` are framework-owned lifecycle state. For administrative control, use `await pool.add(id, value)` / `await pool.enable(id)` / `await pool.disable(id)` / `await pool.remove(id)` instead.
 - **Don't share one `Pool` across asyncio event loops.** The internal lock binds to the loop where it was first awaited; reusing the pool from a different loop is undefined behavior.
 
 ## Gotcha: Cancellation Only Hits Younger Siblings
@@ -42,11 +42,12 @@ One known edge: if an outer cancellation lands in the same event-loop tick as an
 ## Testing
 
 ```bash
-# pip (>= 25.1 for --group)
+# pip (>= 25.1 for --group). The dev group includes prometheus_client so
+# collector tests run; the prometheus extra is for applications, not tests.
 pip install -e . --group dev
 pytest
 
-# uv
+# uv (default groups include dev; --all-extras pulls agent + prometheus)
 uv sync --all-extras
 uv run pytest
 ```

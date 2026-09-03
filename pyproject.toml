@@ -1,6 +1,6 @@
 [project]
 name = "rotapool"
-version = "0.3.0"
+version = "0.4.0"
 description = "Generic async resource pool with health-aware selection, cooldown, and retry"
 readme = "README.md"
 license = "MIT"
@@ -29,11 +29,13 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-agent = ["agent-readable>=0.2.0"]
+agent = ["agent-readable>=0.3.1"]
+prometheus = ["prometheus_client>=0.17"]
 
 [project.urls]
 Source = "https://github.com/zydo/rotapool"
 Issues = "https://github.com/zydo/rotapool/issues"
+Changelog = "https://github.com/zydo/rotapool/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
@@ -44,6 +46,9 @@ packages = ["src/rotapool"]
 
 [tool.ruff]
 line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "UP"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -72,4 +77,5 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.10",
     "pyright==1.1.411",
+    "prometheus_client>=0.17",
 ]

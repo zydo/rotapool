@@ -85,10 +85,10 @@ Waiters also react to admin calls: `pool.add()` wakes them so they can acquire n
 
 ## Admin Control
 
-`pool.add(resource_id, value, max_in_flight=None)`, `pool.enable(resource_id)`, `pool.disable(resource_id)`, and `pool.remove(resource_id)` give operators write access to resource lifecycle state -- the counterpart to `snapshot()`:
+`pool.add(resource_id, value, max_in_flight=None)`, `pool.enable(resource_id)`, `pool.disable(resource_id)`, and `pool.remove(resource_id)` give operators write access to resource lifecycle state -- the counterpart to `snapshot()` / `stats()`:
 
 - **`add()`** adds new capacity at runtime. You pass only `resource_id`, `value`, and optional `max_in_flight`; the pool constructs a fresh healthy `Resource` with no cooldown history. Duplicate `resource_id`s raise `ValueError`. Added resources append to pool order, so under `primary_backup` they are the lowest-priority fallback until earlier resources become unavailable.
-- **`remove()`** drops a resource from the pool entirely: it disappears from selection and `snapshot()`, and the pool stops referencing its `value` -- unlike `disable()`, which keeps the (often secret) value in memory. In-flight usages finish naturally, exactly like admin disable. Raises `KeyError` for an unknown `resource_id`; re-adding the same id later starts from fresh default state, except that usages still draining from the removed resource count toward the re-added one's `in_flight` (and `max_in_flight`) until they finish -- capacity stays conservative during the overlap.
+- **`remove()`** drops a resource from the pool entirely: it disappears from selection, `snapshot()`, and `stats().resources`, and the pool stops referencing its `value` -- unlike `disable()`, which keeps the (often secret) value in memory. Pool-level `stats()` counters are unchanged. In-flight usages finish naturally, exactly like admin disable. Raises `KeyError` for an unknown `resource_id`; re-adding the same id later starts from fresh default state, except that usages still draining from the removed resource count toward the re-added one's `in_flight` (and `max_in_flight`) until they finish -- capacity stays conservative during the overlap.
 - **`disable()`** removes a resource from selection until `enable()` is called. Unlike an operation raising `DisableResource`, in-flight usages are not cancelled -- admin disable is policy, not failure evidence, so running work, which may already have upstream side effects, finishes naturally.
 - **`enable()`** returns a resource to selection: it clears both the disabled state and any active cooldown, and resets `consecutive_cooldown` to 0. Enable means "the operator says this resource is usable now", for example a rotated key, so if the operator is wrong, escalation restarts from the first `cooldown_table` slot rather than resuming where it left off.
 
@@ -96,7 +96,29 @@ All four are async because they take the pool lock. `enable()` / `disable()` are
 
 ## Observability
 
-`snapshot()` is the poll-based view: per resource, `status`, `in_flight`, `max_in_flight` (the cap that makes `in_flight` interpretable), `consecutive_cooldown`, `cooldown_seconds_remaining`, and `last_acquired_at`. It is lock-free and thread-safe, and reports an expired cooldown as `healthy` even though the stored status only flips on the next acquire.
+There are three surfaces; they do different jobs.
+
+`snapshot()` is the operator / JSON view: per resource, `status`, `in_flight`, `max_in_flight` (the cap that makes `in_flight` interpretable), `consecutive_cooldown`, `cooldown_seconds_remaining`, and `last_acquired_at`. It is lock-free and thread-safe, and reports an expired cooldown as `healthy` even though the stored status only flips on the next acquire. `last_acquired_at` is a `time.monotonic()` reading -- do not scrape it as a timestamp.
+
+`stats()` is the metrics view. Gauges are Prometheus-ready: numeric, `by_status` always contains all three status keys (including zeros), `ResourceStats.status_one_hot()` is a 0/1 series per state, and `max_in_flight_gauge` is `+Inf` when unbounded. It does not include `last_acquired_at`. Counters only increase:
+
+- **Pool-level** (`attempts`, `successes`, `cooldowns`, `disables`, `sibling_cancels`, and `runs_*` by outcome) are process-lifetime and survive `remove()`. Never reconstruct them by summing per-resource counters -- that would drop on membership change and break Prometheus `rate()`.
+- **Per-resource** counters are membership-scoped: `remove()` drops the series; `add()` of the same id starts at 0.
+
+`runs_ok` is a normal return, `runs_exhausted` is `PoolExhausted`, `runs_error` is any other exception from the operation (the resource is still marked healthy), and `runs_cancelled` is outer caller cancellation. Constructor / argument `ValueError` is not a run and is not counted. `cooldowns` counts every `CooldownResource` event, including escalations (`cooling_down -> cooling_down`). `disables` counts real transitions to disabled (signal or admin), not no-op admin calls.
+
+Derived pool gauges: `eligible` is effectively healthy and under `max_in_flight`; `saturated` is effectively healthy and at `max_in_flight`; cooling or disabled resources are neither.
+
+`prometheus_client` is not a core dependency. Install `rotapool[prometheus]` and register one `PoolCollector` per registry. Metric names are frozen (`rotapool_runs_total`, `rotapool_resource_status`, ... -- see `rotapool.prometheus`). The `pool` label distinguishes pools; a second collector on the same registry collides on names, so pass `pools={"api_keys": keys, "proxies": proxies}` instead.
+
+```python
+from prometheus_client import REGISTRY
+from rotapool.prometheus import PoolCollector
+
+REGISTRY.register(PoolCollector(pool, pool_name="api_keys"))
+```
+
+Without the extra, scrape `pool.stats()` into whatever client you already use -- the gauges are already numeric. A runnable scrape is [`examples/prometheus_pool.py`](../examples/prometheus_pool.py).
 
 For push notifications, pass an `on_state_change` callback to the constructor:
 
@@ -114,7 +136,7 @@ It is called at the moment a resource's health status changes:
 - **Enable** -- `any -> healthy`, including cooldown recovery.
 - **Expiry** -- `cooling_down -> healthy`, fired lazily at selection time when an expired cooldown is observed.
 
-It is not called for `add()` / `remove()` (membership, not a status transition), cooldown-state resets on success, or no-op admin calls such as enabling a healthy resource. The hook runs synchronously while the pool lock is held: keep it fast, never block, and never call the pool's `async` methods from it (`snapshot()` is safe -- it is lock-free). An exception raised by the hook is logged to the `rotapool` logger and swallowed; monitoring must not break failover.
+It is not called for `add()` / `remove()` (membership, not a status transition), cooldown-state resets on success, or no-op admin calls such as enabling a healthy resource. The hook runs synchronously while the pool lock is held: keep it fast, never block, and never call the pool's `async` methods from it (`snapshot()` and `stats()` are safe -- they are lock-free). An exception raised by the hook is logged to the `rotapool` logger and swallowed; monitoring must not break failover. Do not use it as a metrics bus -- incrementing counters from the hook is lossy (it does not fire on success, exhaustion, retries, or membership) and holds the pool lock.
 
 ## Cancellation Discrimination
 
