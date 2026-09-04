@@ -165,6 +165,7 @@ class PoolStats:
     cooldowns: int
     disables: int
     sibling_cancels: int
+    retries: int
     runs_ok: int
     runs_exhausted: int
     runs_error: int
@@ -177,7 +178,7 @@ Do not construct ``PoolStats``. Call ``pool.stats()``.
 
 Gauges (``in_flight``, ``eligible``, ``saturated``, ``by_status``) describe
 current membership. Counters (``attempts``, ``successes``, ``cooldowns``,
-``disables``, ``sibling_cancels``, ``runs_ok`` / ``runs_exhausted`` /
+``disables``, ``sibling_cancels``, ``retries``, ``runs_ok`` / ``runs_exhausted`` /
 ``runs_error`` / ``runs_cancelled``) are process-lifetime and survive
 ``remove()``. Never sum ``resources`` to rebuild them -- that drops on
 membership change and breaks Prometheus ``rate()``.

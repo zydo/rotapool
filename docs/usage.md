@@ -9,8 +9,17 @@ Not every failure means the resource is bad -- an HTTP 400 is your bug, but a 42
 | Signal                              | Meaning                                |
 | ----------------------------------- | -------------------------------------- |
 | normal return / any other exception | Resource is healthy                    |
+| `RetryOperation`                    | Transient glitch (timeout, reset, 502); retry, no cooldown |
 | `CooldownResource`                  | Temporarily overloaded, e.g. 429       |
 | `DisableResource`                   | Permanently unusable, e.g. revoked key |
+
+Map transport errors explicitly. Leaving `TimeoutError` / `ConnectError` as
+"any other exception" means no retry and no failover:
+
+```python
+except httpx.TransportError:
+    raise RetryOperation(reason="transport")
+```
 
 `rotapool` handles the rest -- picks the best resource, cools down bad ones, cancels doomed in-flight work, and retries automatically.
 

@@ -34,6 +34,20 @@ class DisableResource(Exception):
         self.reason = reason
 
 
+class RetryOperation(Exception):
+    """Raise from a user operation for a transient failure on a healthy resource.
+
+    Consumes one attempt and retries (the same resource may be selected again).
+    Does not start a cooldown, does not increment consecutive_cooldown, and does
+    not cancel younger siblings. Use for timeouts, connection resets, 502s --
+    not for 429 (CooldownResource) or 401 (DisableResource).
+    """
+
+    def __init__(self, reason: str | None = None) -> None:
+        super().__init__(reason or "transient retry")
+        self.reason = reason
+
+
 class PoolExhausted(Exception):
     """Raised by the framework when the pool cannot satisfy a request.
 

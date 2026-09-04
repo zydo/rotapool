@@ -1,6 +1,11 @@
 from importlib.metadata import version as _version
 
-from .exceptions import CooldownResource, DisableResource, PoolExhausted
+from .exceptions import (
+    CooldownResource,
+    DisableResource,
+    PoolExhausted,
+    RetryOperation,
+)
 from .models import PoolStats, Resource, ResourceStats
 from .pool import Pool
 
@@ -10,6 +15,7 @@ __all__ = [
     "DisableResource",
     "Pool",
     "PoolExhausted",
+    "RetryOperation",
     "PoolStats",
     "Resource",
     "ResourceStats",

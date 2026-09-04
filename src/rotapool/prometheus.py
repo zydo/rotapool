@@ -49,6 +49,7 @@ SUCCESSES_TOTAL = "rotapool_successes_total"
 COOLDOWNS_TOTAL = "rotapool_cooldowns_total"
 DISABLES_TOTAL = "rotapool_disables_total"
 SIBLING_CANCELS_TOTAL = "rotapool_sibling_cancels_total"
+RETRIES_TOTAL = "rotapool_retries_total"
 IN_FLIGHT = "rotapool_in_flight"
 ELIGIBLE = "rotapool_eligible"
 SATURATED = "rotapool_saturated"
@@ -107,6 +108,11 @@ def _empty_families() -> list[Any]:
         CounterMetricFamily(
             SIBLING_CANCELS_TOTAL,
             "Younger in-flight usages cancelled by a sibling cooldown or disable.",
+            labels=["pool"],
+        ),
+        CounterMetricFamily(
+            RETRIES_TOTAL,
+            "Transient retry signals (RetryOperation).",
             labels=["pool"],
         ),
         GaugeMetricFamily(
@@ -276,6 +282,7 @@ are module-level constants on ``rotapool.prometheus``.
             cooldowns,
             disables,
             sibling_cancels,
+            retries,
             in_flight,
             eligible,
             saturated,
@@ -304,6 +311,7 @@ are module-level constants on ``rotapool.prometheus``.
             cooldowns.add_metric([pool_name], stats.cooldowns)
             disables.add_metric([pool_name], stats.disables)
             sibling_cancels.add_metric([pool_name], stats.sibling_cancels)
+            retries.add_metric([pool_name], stats.retries)
             in_flight.add_metric([pool_name], stats.in_flight)
             eligible.add_metric([pool_name], stats.eligible)
             saturated.add_metric([pool_name], stats.saturated)
@@ -340,6 +348,7 @@ are module-level constants on ``rotapool.prometheus``.
         yield cooldowns
         yield disables
         yield sibling_cancels
+        yield retries
         yield in_flight
         yield eligible
         yield saturated

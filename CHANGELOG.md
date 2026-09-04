@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CancelledError`.
 - Applying a cooldown signal wakes `wait_for_cooldown` sleepers so they
   recompute the earliest expiry.
+- `RetryOperation` -- transient retry without cooldown or sibling cancel.
+  Pool-level `stats().retries` and Prometheus `rotapool_retries_total`.
+- `pool.add(Resource(...))` in addition to `add(id, value)`.
+- `wait_for_cooldown=True` no longer clamps the attempt budget to the
+  resource count, so a single-resource pool can wait out its own cooldown
+  within `max_attempts`.
 
 ## [0.4.0] - 2026-09-02
 

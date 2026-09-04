@@ -170,11 +170,13 @@ pool.stats() -> PoolStats
 
 ```python
 await pool.add(
-    resource_id: str,
-    value: T,
+    resource_id: str | Resource[T],
+    value: T | None = None,
     *,
     max_in_flight: int | None = None,
 ) -> Resource[T]
+# Triple form: add(resource_id, value, max_in_flight=). Resource form:
+# add(Resource(...)) -- omit value. Duplicate ids raise ValueError.
 # Add a new healthy resource at runtime. The pool constructs the Resource using
 # lifecycle defaults: status="healthy", cooldown_until=0.0, last_acquired_at=0.0,
 # consecutive_cooldown=0. Duplicate resource_id raises ValueError. The new
@@ -247,6 +249,7 @@ resource = Resource(
 | ------------------ | -------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `CooldownResource` | Your operation | Resource temporarily over capacity                                                                                          |
 | `DisableResource`  | Your operation | Resource permanently bad (only `pool.enable()` brings it back)                                                              |
+| `RetryOperation`   | Your operation | Transient failure: retry (same resource allowed), no cooldown                                                               |
 | `PoolExhausted`    | Framework      | No eligible resource, max attempts reached, deadline passed, or (with `wait_for_cooldown`) waiting cannot beat the deadline |
 
 ```python

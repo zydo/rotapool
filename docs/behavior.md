@@ -73,7 +73,7 @@ Cancellation is best-effort: it works when the operation returns a coroutine (th
 
 ## Retry
 
-`pool.run()` drives the retry loop. `@pool.use()` is a thin decorator shim over it. Attempts are capped at `min(max_attempts, len(resources))` -- more retries than resources is pointless.
+`pool.run()` drives the retry loop. `@pool.use()` is a thin decorator shim over it. In fail-fast mode attempts are capped at `min(max_attempts, len(resources))`. With `wait_for_cooldown=True` the cap is `max_attempts` only, so a single-resource pool can wait out its own cooldown.
 
 The pause between attempts is jittered: `retry_delay * uniform(0.5, 1.5)`, mean `retry_delay`. Without jitter, concurrent calls that hit the same cooldown would all wake at the same instant and stampede the next eligible resource.
 

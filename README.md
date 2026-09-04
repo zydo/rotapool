@@ -10,6 +10,7 @@ Async resource pool with inline health feedback, automatic cooldown, and retry -
 | Signal                              | Meaning                                |
 | ----------------------------------- | -------------------------------------- |
 | normal return / any other exception | Resource is healthy                    |
+| `RetryOperation`                    | Transient glitch; retry, no cooldown   |
 | `CooldownResource`                  | Temporarily overloaded, e.g. HTTP 429  |
 | `DisableResource`                   | Permanently unusable, e.g. revoked key |
 

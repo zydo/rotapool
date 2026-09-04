@@ -35,7 +35,12 @@ else:
             """
 
 
-from .exceptions import CooldownResource, DisableResource, PoolExhausted
+from .exceptions import (
+    CooldownResource,
+    DisableResource,
+    PoolExhausted,
+    RetryOperation,
+)
 from .models import (
     RESOURCE_STATUSES,
     PoolStats,
@@ -80,6 +85,7 @@ class _PoolCounters:
     cooldowns: int = 0
     disables: int = 0
     sibling_cancels: int = 0
+    retries: int = 0
     runs_ok: int = 0
     runs_exhausted: int = 0
     runs_error: int = 0
@@ -275,9 +281,9 @@ class Pool(AgentReadableMixin, Generic[T]):
         """Drive the retry loop for one logical request.
 
         operation: callable receiving the selected resource and returning an Awaitable.
-            May raise CooldownResource or DisableResource to signal resource health. Any
-            other exception is treated as resource OK and propagates to the caller (so
-            user-side bugs do not poison the pool).
+            May raise CooldownResource, DisableResource, or RetryOperation to
+            signal resource health. Any other exception is treated as resource OK
+            and propagates to the caller (so user-side bugs do not poison the pool).
 
             The returned awaitable can be:
             - a coroutine (the typical case for `async def` operations) -- the framework
@@ -371,7 +377,10 @@ class Pool(AgentReadableMixin, Generic[T]):
         wait_for_cooldown: bool,
     ) -> R:
         """Drive the retry loop. ``run()`` wraps this to record the outcome."""
-        effective_attempts = min(cap, len(self._resources))
+        if wait_for_cooldown:
+            effective_attempts = cap
+        else:
+            effective_attempts = min(cap, len(self._resources))
         if effective_attempts < 1:
             # Only reachable via remove() emptying the pool (construction
             # requires >= 1 resource). Report the real cause instead of falling
@@ -428,6 +437,13 @@ class Pool(AgentReadableMixin, Generic[T]):
 
             except DisableResource as e:
                 await self._on_disable(usage)
+                last_error = e
+                if attempt_num < effective_attempts - 1:
+                    await self._sleep_before_retry(retry_delay, deadline)
+                continue
+
+            except RetryOperation as e:
+                self._pool_counters.retries += 1
                 last_error = e
                 if attempt_num < effective_attempts - 1:
                     await self._sleep_before_retry(retry_delay, deadline)
@@ -608,6 +624,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             cooldowns=pc.cooldowns,
             disables=pc.disables,
             sibling_cancels=pc.sibling_cancels,
+            retries=pc.retries,
             runs_ok=pc.runs_ok,
             runs_exhausted=pc.runs_exhausted,
             runs_error=pc.runs_error,
@@ -634,34 +651,55 @@ class Pool(AgentReadableMixin, Generic[T]):
 
     async def add(
         self,
-        resource_id: str,
-        value: T,
+        resource_id: str | Resource[T],
+        value: T | None = None,
         *,
         max_in_flight: int | None = None,
     ) -> Resource[T]:
         """Add a new healthy resource to the pool.
 
-        The caller supplies only the stable identity, the resource value, and the
-        optional capacity cap. Lifecycle state is always initialized from the
-        ``Resource`` defaults: healthy, no cooldown, no prior acquisition, and no
-        consecutive cooldown count. The new resource is appended to the pool's
-        insertion order, so it is the lowest-priority fallback under
-        ``"primary_backup"``.
+        Two call shapes:
+
+        - ``add(resource_id, value, max_in_flight=None)`` -- constructs a
+          ``Resource`` from parts (0.4.0 form).
+        - ``add(Resource(...))`` -- same lifecycle defaults; ``value`` must
+          be omitted.
+
+        Lifecycle state is always initialized from the ``Resource`` defaults:
+        healthy, no cooldown, no prior acquisition, and no consecutive cooldown
+        count. The new resource is appended to the pool's insertion order, so it
+        is the lowest-priority fallback under ``"primary_backup"``.
 
         Wakes any ``run(wait_for_cooldown=True)`` sleepers so a newly added healthy
         resource can satisfy them immediately.
 
         Raises ValueError for a duplicate ``resource_id`` or invalid ``Resource``
-        constructor arguments.
+        constructor arguments. Raises TypeError if both a ``Resource`` and
+        ``value`` are passed, or if ``value`` is omitted for the triple form.
         """
-        resource = Resource(
-            resource_id=resource_id,
-            value=value,
-            max_in_flight=max_in_flight,
-        )
+        if isinstance(resource_id, Resource):
+            if value is not None:
+                raise TypeError("do not pass value when adding a Resource")
+            src = resource_id
+            cap = max_in_flight if max_in_flight is not None else src.max_in_flight
+            resource = Resource(
+                resource_id=src.resource_id,
+                value=src.value,
+                max_in_flight=cap,
+            )
+        else:
+            if value is None:
+                raise TypeError("value is required when resource_id is a string")
+            resource = Resource(
+                resource_id=resource_id,
+                value=value,
+                max_in_flight=max_in_flight,
+            )
         async with self._admin_changed:
             if resource.resource_id in self._resources:
-                raise ValueError(f"Duplicate resource_id in pool: {resource_id!r}")
+                raise ValueError(
+                    f"Duplicate resource_id in pool: {resource.resource_id!r}"
+                )
             # Counters first so a lock-free stats() that sees the new resource
             # never observes a missing counter dict entry.
             self._resource_counters[resource.resource_id] = _ResourceCounters()

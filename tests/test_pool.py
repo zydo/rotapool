@@ -41,6 +41,7 @@ from rotapool import (
     PoolStats,
     Resource,
     ResourceStats,
+    RetryOperation,
 )
 from rotapool.models import RESOURCE_STATUSES, Usage
 
@@ -390,6 +391,50 @@ class TestRetry:
             )
 
         assert sum(tally.values()) >= 1
+
+    async def test_b6_retry_operation_does_not_cool(self) -> None:
+        pool = Pool(resources=_res(3), max_attempts=3, cooldown_table=FAST_TABLE)
+        n = {"i": 0}
+
+        async def op(r: Resource[str]) -> str:
+            n["i"] += 1
+            if n["i"] < 3:
+                raise RetryOperation(reason="timeout")
+            return r.value
+
+        assert await pool.run(op, retry_delay=0) in {"v0", "v1", "v2"}
+        snap = pool.snapshot()["r0"]
+        assert snap["status"] == "healthy"
+        assert snap["consecutive_cooldown"] == 0
+        assert pool.stats().retries == 2
+        assert pool.stats().cooldowns == 0
+        assert n["i"] == 3
+
+    async def test_b7_retry_operation_exhausts(self) -> None:
+        pool = Pool(resources=_res(3), max_attempts=3, cooldown_table=FAST_TABLE)
+
+        async def op(_: Resource[str]) -> str:
+            raise RetryOperation(reason="timeout")
+
+        with pytest.raises(PoolExhausted) as ei:
+            await pool.run(op, retry_delay=0)
+        assert "RetryOperation" in repr(ei.value)
+        assert pool.stats().retries == 3
+        assert all(row["status"] == "healthy" for row in pool.snapshot().values())
+
+    async def test_b8_timeout_error_still_no_retry(self) -> None:
+        pool = Pool(resources=_res(2), max_attempts=3, cooldown_table=FAST_TABLE)
+        seen: list[str] = []
+
+        async def op(r: Resource[str]) -> str:
+            seen.append(r.resource_id)
+            raise TimeoutError("proxy dead")
+
+        with pytest.raises(TimeoutError):
+            await pool.run(op, retry_delay=0)
+        assert seen == ["r0"]
+        assert pool.stats().retries == 0
+        assert pool.stats().runs_error == 1
 
 
 # ===================================================================
@@ -1602,6 +1647,34 @@ class TestWaitForCooldown:
         await pool.enable("r0")
         assert await waiter == "v0"
 
+    async def test_i9_wait_mode_does_not_clamp_budget_to_pool_size(self) -> None:
+        """wait_for_cooldown=True: budget is max_attempts, not min(max_attempts, n)."""
+        pool = Pool(
+            resources=_res(1),
+            max_attempts=3,
+            cooldown_table=(0.05,),
+        )
+        n = {"i": 0}
+
+        async def op(r: Resource[str]) -> str:
+            n["i"] += 1
+            if n["i"] == 1:
+                raise CooldownResource(cooldown_seconds=0.05)
+            return r.value
+
+        assert await pool.run(op, wait_for_cooldown=True, retry_delay=0) == "v0"
+        assert n["i"] == 2
+
+        n2 = {"i": 0}
+
+        async def op_fail(r: Resource[str]) -> str:
+            n2["i"] += 1
+            raise CooldownResource(cooldown_seconds=0.05)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(op_fail, wait_for_cooldown=False, retry_delay=0, max_attempts=3)
+        assert n2["i"] == 1
+
 
 # ===================================================================
 # Group J — Admin enable / disable
@@ -1734,6 +1807,20 @@ class TestDynamicAdd:
             await pool.add("r0", "duplicate")
 
         assert set(pool.snapshot()) == {"r0"}
+
+    async def test_k2b_add_accepts_resource_object(self, ops: Ops) -> None:
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE)
+        added = await pool.add(Resource(resource_id="b", value="w", max_in_flight=2))
+        assert added.resource_id == "b"
+        assert added.max_in_flight == 2
+        await pool.disable("r0")
+        assert await pool.run(ops.identity()) == "w"
+        with pytest.raises(TypeError, match="do not pass value"):
+            await pool.add(Resource(resource_id="c", value="x"), "y")
+        with pytest.raises(TypeError, match="value is required"):
+            await pool.add("c")  # type: ignore[call-arg]
+        with pytest.raises(ValueError, match="Duplicate"):
+            await pool.add(Resource(resource_id="b", value="again"))
 
     async def test_k3_add_appends_under_primary_backup(self, ops: Ops) -> None:
         """primary_backup keeps existing priorities; added resources append last."""
@@ -2173,6 +2260,7 @@ class TestStats:
         assert s.saturated == 0
         assert s.attempts == s.successes == s.cooldowns == s.disables == 0
         assert s.sibling_cancels == 0
+        assert s.retries == 0
         assert s.runs_ok == s.runs_exhausted == s.runs_error == s.runs_cancelled == 0
 
         rs = s.resources["r0"]
