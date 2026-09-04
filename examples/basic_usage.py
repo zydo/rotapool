@@ -14,6 +14,10 @@ import random
 
 from rotapool import CooldownResource, DisableResource, Pool, Resource
 
+# Seeded so the script is deterministic in CI. Its own generator, kept
+# separate from the global one the pool draws retry jitter from.
+_rng = random.Random(8)
+
 pool = Pool(
     resources=[
         Resource(resource_id="key-1", value="sk-aaa"),
@@ -27,7 +31,7 @@ pool = Pool(
 
 def fake_upstream(api_key: str, payload: str) -> str:
     """Stand-in for an HTTP call. Raise the same signals a real client would."""
-    roll = random.random()
+    roll = _rng.random()
     if roll < 0.25:
         raise CooldownResource(reason="rate limited")
     if roll < 0.27:
