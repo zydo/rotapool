@@ -15,17 +15,13 @@ from rotapool import CooldownResource, DisableResource, Pool, PoolExhausted, Res
 STRATEGY = {"least_in_flight": "round_robin", "primary_backup": "primary_backup"}
 
 
-def _scenarios_path() -> Path:
+def _scenarios_path() -> Path | None:
     env = os.environ.get("ROTAPOOL_SCENARIOS")
     if env:
-        return Path(env)
+        path = Path(env)
+        return path if path.is_file() else None
     sibling = Path(__file__).resolve().parents[2] / "rotapool-spec/conformance/scenarios.yaml"
-    if sibling.is_file():
-        return sibling
-    raise FileNotFoundError(
-        "scenarios.yaml not found; set ROTAPOOL_SCENARIOS or check out rotapool-spec "
-        "as a sibling of rotapool"
-    )
+    return sibling if sibling.is_file() else None
 
 
 class VirtualClock:
@@ -68,8 +64,14 @@ class VirtualClock:
 
 
 def _load_scenarios() -> list[dict[str, Any]]:
-    data = yaml.safe_load(_scenarios_path().read_text())
+    path = _scenarios_path()
+    if path is None:
+        return []
+    data = yaml.safe_load(path.read_text())
     return list(data["scenarios"])
+
+
+_SCENARIOS = _load_scenarios()
 
 
 def _resource_from(spec: dict[str, Any]) -> Resource[str]:
@@ -313,7 +315,8 @@ def _check(actual: dict[str, Any], expect: dict[str, Any]) -> list[str]:
     return errors
 
 
-@pytest.mark.parametrize("scenario", _load_scenarios(), ids=lambda s: s["id"])
+@pytest.mark.skipif(not _SCENARIOS, reason="rotapool-spec scenarios.yaml not found")
+@pytest.mark.parametrize("scenario", _SCENARIOS, ids=lambda s: s["id"])
 async def test_conformance_scenario(scenario: dict[str, Any]) -> None:
     try:
         driver = _Driver(scenario)

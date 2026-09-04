@@ -1151,6 +1151,12 @@ class TestAPI:
         with pytest.raises(ValueError, match="at least one resource"):
             Pool(resources=[])
 
+    def test_h1b_cancel_siblings_and_probe_must_be_bool(self) -> None:
+        with pytest.raises(TypeError, match="cancel_siblings must be bool"):
+            Pool(resources=_res(1), cancel_siblings="yes")  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="probe_on_recovery must be bool"):
+            Pool(resources=_res(1), probe_on_recovery="yes")  # type: ignore[arg-type]
+
     def test_h2_duplicate_resource_id(self) -> None:
         """Duplicate resource_id in list form → ValueError."""
         with pytest.raises(ValueError, match="Duplicate resource_id"):

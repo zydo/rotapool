@@ -52,9 +52,32 @@ jobs:
         with:
           cache-suffix: test-py${{ matrix.python-version }}
       - run: uv sync --all-extras
+      - name: Checkout rotapool-spec (conformance scenarios)
+        uses: actions/checkout@v7
+        with:
+          repository: zydo/rotapool-spec
+          path: rotapool-spec
+        continue-on-error: true
       - run: uv run pytest -q --cov-fail-under=100
+        env:
+          ROTAPOOL_SCENARIOS: ${{ github.workspace }}/rotapool-spec/conformance/scenarios.yaml
       - name: Examples
         run: |
           uv run python examples/basic_usage.py
           uv run python examples/prometheus_pool.py --once | tee /tmp/rotapool-metrics.txt
           grep -q rotapool_runs_total /tmp/rotapool-metrics.txt
+
+  stable-clause-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: zydo/rotapool-spec
+          path: rotapool-spec
+        continue-on-error: true
+      - name: Fail if a [status: stable] clause is unnamed in scenarios.yaml
+        if: hashFiles('rotapool-spec/SPEC.md') != ''
+        run: python3 rotapool-spec/conformance/scan_stable.py
+        env:
+          ROTAPOOL_SPEC: ${{ github.workspace }}/rotapool-spec

@@ -58,13 +58,16 @@ pool = Pool(
     retry_delay=0.5,           # Base pause between failed attempts (jittered +/-50%)
     wait_for_cooldown=False,   # Wait out the earliest cooldown instead of failing fast
 )
+client = httpx.AsyncClient()  # outside the operation; captured by the body
+
+# Create the HTTP client outside the operation; run() invokes the body once
+# per attempt, so constructing the client inside would redo TLS every retry.
 async def call_upstream(resource, url, payload):
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            url,
-            headers={"Authorization": f"Bearer {resource.value}"},
-            json=payload,
-        )
+    resp = await client.post(
+        url,
+        headers={"Authorization": f"Bearer {resource.value}"},
+        json=payload,
+    )
 
     if resp.status_code == 429:
         raise CooldownResource(
@@ -91,12 +94,11 @@ Use `run()` directly when you want per-call overrides or when the call site cann
 
 ```python
 async def call_upstream(resource, url, payload):
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            url,
-            headers={"Authorization": f"Bearer {resource.value}"},
-            json=payload,
-        )
+    resp = await client.post(
+        url,
+        headers={"Authorization": f"Bearer {resource.value}"},
+        json=payload,
+    )
 
     if resp.status_code == 429:
         raise CooldownResource(reason="rate limited")
