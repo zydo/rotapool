@@ -1166,20 +1166,23 @@ class Pool(AgentReadableMixin, Generic[T]):
 
         Used instead of ``Condition.wait`` + ``wait_for`` so tests can inject
         ``_sleep`` (virtual time) without blocking on loop wall-clock timeouts.
+        The two racers resolve one shared future rather than going through
+        ``asyncio.wait``: that keeps the caller's resume line traceable for
+        coverage on CPython 3.11.
         """
-        sleep_t = asyncio.create_task(self._sleep_for(delay))
-        pulse_t = asyncio.create_task(self._wait_pulse.wait())
+        loop = asyncio.get_running_loop()
+        first_done: asyncio.Future[None] = loop.create_future()
+
+        def _finish(_: object) -> None:
+            if not first_done.done():
+                first_done.set_result(None)
+
+        sleep_t = asyncio.ensure_future(self._sleep_for(delay))
+        pulse_t = asyncio.ensure_future(self._wait_pulse.wait())
+        sleep_t.add_done_callback(_finish)
+        pulse_t.add_done_callback(_finish)
         try:
-            _done, pending = await asyncio.wait(
-                {sleep_t, pulse_t}, return_when=asyncio.FIRST_COMPLETED
-            )
-            for t in pending:
-                t.cancel()
-            for t in pending:
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
+            await first_done
         finally:
             for t in (sleep_t, pulse_t):
                 if not t.done():
