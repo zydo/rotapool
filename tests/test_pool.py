@@ -2129,11 +2129,16 @@ class TestRemove:
 class TestStateChangeHook:
     @staticmethod
     def _recorder() -> tuple[
-        list[tuple[str, str, str]], Callable[[str, str, str], None]
+        list[tuple[str, str, str]], Callable[[str, str, str, int], None]
     ]:
+        """A current-form (4-arg) hook that records only the transition triple.
+
+        Tests that assert on the deprecation of the legacy 3-arg form define
+        their own 3-arg hook instead (see test_m11).
+        """
         events: list[tuple[str, str, str]] = []
 
-        def hook(resource_id: str, old: str, new: str) -> None:
+        def hook(resource_id: str, old: str, new: str, seq: int) -> None:
             events.append((resource_id, old, new))
 
         return events, hook
@@ -2253,7 +2258,7 @@ class TestStateChangeHook:
     ) -> None:
         """A raising hook must not break the transition or the run loop."""
 
-        def bad_hook(resource_id: str, old: str, new: str) -> None:
+        def bad_hook(resource_id: str, old: str, new: str, seq: int) -> None:
             raise RuntimeError("hook bug")
 
         pool = Pool(
@@ -2322,7 +2327,11 @@ class TestStateChangeHook:
         assert seqs == [1, 2]
 
     async def test_m11_three_arg_hook_is_deprecated(self) -> None:
-        events, hook = self._recorder()
+        events: list[tuple[str, str, str]] = []
+
+        def hook(resource_id: str, old: str, new: str) -> None:
+            events.append((resource_id, old, new))
+
         with pytest.warns(DeprecationWarning, match="fourth seq"):
             pool = Pool(
                 resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook
