@@ -86,6 +86,7 @@ class _VirtualClock:
                 fut.cancel()
             raise
 
+
 _T = TypeVar("_T")
 
 # Strong-ref set so the body tasks driving futures are not GC'd before they resolve.
@@ -1678,7 +1679,9 @@ class TestWaitForCooldown:
             raise CooldownResource(cooldown_seconds=0.05)
 
         with pytest.raises(PoolExhausted):
-            await pool.run(op_fail, wait_for_cooldown=False, retry_delay=0, max_attempts=3)
+            await pool.run(
+                op_fail, wait_for_cooldown=False, retry_delay=0, max_attempts=3
+            )
         assert n2["i"] == 1
 
     async def test_i10_probe_on_recovery_limits_to_one(self) -> None:
@@ -1710,7 +1713,9 @@ class TestWaitForCooldown:
             await hold.wait()
             return r.value
 
-        tasks = [asyncio.create_task(pool.run(hold_body, retry_delay=0)) for _ in range(10)]
+        tasks = [
+            asyncio.create_task(pool.run(hold_body, retry_delay=0)) for _ in range(10)
+        ]
         for _ in range(200):
             await asyncio.sleep(0)
             if len(hits) >= 10:
@@ -1729,7 +1734,9 @@ class TestWaitForCooldown:
             await hold2.wait()
             return r.value
 
-        tasks = [asyncio.create_task(pool.run(hold2_body, retry_delay=0)) for _ in range(10)]
+        tasks = [
+            asyncio.create_task(pool.run(hold2_body, retry_delay=0)) for _ in range(10)
+        ]
         for _ in range(200):
             await asyncio.sleep(0)
             if len(hits) >= 10:
@@ -1737,6 +1744,65 @@ class TestWaitForCooldown:
         assert hits.count("r0") == 10
         hold2.set()
         await asyncio.gather(*tasks)
+
+    async def test_i11_wake_acquires_inside_the_cooldown_loop(self) -> None:
+        """After sleeping toward the expiry, the retry _inside_
+        _acquire_after_cooldown succeeds on its own -- no admin nudge, no
+        bounce back to the outer attempt loop."""
+        clock = _VirtualClock()
+        pool = Pool(resources=_res(1), cooldown_table=(10.0,), max_attempts=3)
+        pool._now = clock.now  # noqa: SLF001
+        pool._sleep = clock.sleep  # noqa: SLF001
+
+        calls = {"n": 0}
+
+        async def op(r: Resource[str]) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise CooldownResource(cooldown_seconds=10.0)
+            return r.value
+
+        waiter = asyncio.create_task(
+            pool.run(op, wait_for_cooldown=True, retry_delay=0)
+        )
+        for _ in range(100):
+            if clock.n_sleepers:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("waiter never slept toward the cooldown expiry")
+
+        clock.advance(10.0)
+        assert await waiter == "v0"
+        assert calls["n"] == 2
+
+    async def test_i12_cancelling_a_waiter_mid_sleep_cleans_up_timers(self) -> None:
+        """Cancelling run() while it is parked in the cooldown wait propagates
+        CancelledError; the finally-branch cancels the still-pending
+        sleep/pulse tasks that asyncio.wait leaves behind."""
+        pool = Pool(resources=_res(1), cooldown_table=(30.0,))
+
+        async def cooler(_: Resource[str]) -> str:
+            raise CooldownResource(cooldown_seconds=30.0)
+
+        async def ident(r: Resource[str]) -> str:
+            return r.value
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cooler, max_attempts=1)
+
+        waiter = asyncio.create_task(
+            pool.run(ident, wait_for_cooldown=True, retry_delay=0)
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert not waiter.done()
+
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        for _ in range(5):
+            await asyncio.sleep(0)
 
 
 # ===================================================================
@@ -2235,9 +2301,7 @@ class TestStateChangeHook:
         def hook(resource_id: str, old: str, new: str, seq: int) -> None:
             seen_locked.append(pool._lock.locked())  # noqa: SLF001
 
-        pool = Pool(
-            resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook
-        )
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook)
 
         async def cooler(_: Resource[str]) -> str:
             raise CooldownResource(reason="busy")
@@ -2252,9 +2316,7 @@ class TestStateChangeHook:
         def hook(resource_id: str, old: str, new: str, seq: int) -> None:
             seqs.append(seq)
 
-        pool = Pool(
-            resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook
-        )
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook)
         await pool.disable("r0")
         await pool.enable("r0")
         assert seqs == [1, 2]
@@ -2267,6 +2329,20 @@ class TestStateChangeHook:
             )
             await pool.disable("r0")
         assert events == [("r0", "healthy", "disabled")]
+
+    async def test_m12_uninspectable_hook_signature_assumes_legacy_arity(self) -> None:
+        """A hook whose signature inspect cannot read (a C builtin here) is
+        treated as the legacy 3-arg form instead of crashing the flush."""
+        pool = Pool(resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=max)
+
+        async def cooler(r: Resource[str]) -> str:
+            raise CooldownResource(reason="busy")
+
+        with pytest.warns(DeprecationWarning, match="fourth seq"):
+            with pytest.raises(PoolExhausted):
+                await pool.run(cooler, max_attempts=1)
+
+        assert pool._hook_nparams == 3  # noqa: SLF001
 
     async def test_k5_snapshot_survives_concurrent_add(self) -> None:
         """snapshot() from another thread is safe while add() grows the pool.

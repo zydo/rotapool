@@ -263,10 +263,7 @@ class _Driver:
                 "in_flight": row["in_flight"],
                 "cooldown_remaining": row["cooldown_seconds_remaining"],
             }
-        calls = [
-            {"id": rid, "outcome": run.outcome}
-            for rid, run in self.runs.items()
-        ]
+        calls = [{"id": rid, "outcome": run.outcome} for rid, run in self.runs.items()]
         return {
             "calls": calls,
             "resources": resources,
@@ -300,18 +297,16 @@ def _check(actual: dict[str, Any], expect: dict[str, Any]) -> list[str]:
         for key, val in exp.items():
             if key == "cooldown_remaining":
                 if abs(float(got[key]) - float(val)) > 1e-6:
-                    errors.append(
-                        f"{rid}.{key}: expected {val}, got {got[key]}"
-                    )
+                    errors.append(f"{rid}.{key}: expected {val}, got {got[key]}")
             elif got[key] != val:
                 errors.append(f"{rid}.{key}: expected {val}, got {got[key]}")
     for key, val in (expect.get("pool") or {}).items():
         if actual["pool"].get(key) != val:
-            errors.append(
-                f"pool.{key}: expected {val}, got {actual['pool'].get(key)}"
-            )
+            errors.append(f"pool.{key}: expected {val}, got {actual['pool'].get(key)}")
     if "acquired" in expect and actual.get("acquired") != expect["acquired"]:
-        errors.append(f"acquired: expected {expect['acquired']}, got {actual.get('acquired')}")
+        errors.append(
+            f"acquired: expected {expect['acquired']}, got {actual.get('acquired')}"
+        )
     return errors
 
 

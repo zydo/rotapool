@@ -221,14 +221,11 @@ class Pool(AgentReadableMixin, Generic[T]):
         self._on_state_change = on_state_change
         self._hook_nparams: int | None = None
         self._event_seq: int = 0
-        self._pending_events: list[
-            tuple[str, ResourceStatus, ResourceStatus, int]
-        ] = []
+        self._pending_events: list[tuple[str, ResourceStatus, ResourceStatus, int]] = []
 
         if type(cancel_siblings) is not bool:
             raise TypeError(
-                "cancel_siblings must be bool, got "
-                f"{type(cancel_siblings).__name__}"
+                f"cancel_siblings must be bool, got {type(cancel_siblings).__name__}"
             )
         self._cancel_siblings: bool = cancel_siblings
 
@@ -268,19 +265,21 @@ class Pool(AgentReadableMixin, Generic[T]):
         # need a deterministic "younger than" relation.
         self._next_acquisition_order: int = 0
 
-        # Test-only: set `_now` / `_sleep` to override time.monotonic and
-        # asyncio.sleep (conformance virtual clock). Unset in production so
-        # tests that monkeypatch asyncio.sleep still hit the real call site.
         self._wait_pulse: asyncio.Event = asyncio.Event()
 
+        # Test-only knobs: the conformance virtual clock sets these to its
+        # now() / sleep(). Left as None in production, and the fallbacks below
+        # call time.monotonic / asyncio.sleep by reference so a test that
+        # monkeypatches asyncio.sleep still reaches the real thing.
+        self._now: Callable[[], float] | None = None
+        self._sleep: Callable[[float], Awaitable[None]] | None = None
+
     def _timestamp(self) -> float:
-        now = getattr(self, "_now", None)
-        return now() if callable(now) else time.monotonic()
+        return self._now() if self._now is not None else time.monotonic()
 
     async def _sleep_for(self, delay: float) -> None:
-        sleep = getattr(self, "_sleep", None)
-        if callable(sleep):
-            await sleep(delay)
+        if self._sleep is not None:
+            await self._sleep(delay)
         else:
             await asyncio.sleep(delay)
 
@@ -874,15 +873,11 @@ class Pool(AgentReadableMixin, Generic[T]):
         for resource_id, old_status, new_status, seq in events:
             try:
                 if nparams >= 4:
-                    self._on_state_change(
-                        resource_id, old_status, new_status, seq
-                    )
+                    self._on_state_change(resource_id, old_status, new_status, seq)
                 else:
                     self._on_state_change(resource_id, old_status, new_status)
             except Exception:
-                logger.exception(
-                    "on_state_change callback failed for %s", resource_id
-                )
+                logger.exception("on_state_change callback failed for %s", resource_id)
 
     @staticmethod
     def _build_resources(
@@ -998,7 +993,8 @@ class Pool(AgentReadableMixin, Generic[T]):
         sleeping out a plan those calls just invalidated. A spurious wake-up (the
         admin change did not affect this waiter) is harmless -- the loop recomputes.
         """
-        while True:
+        acquired: tuple[Resource[T], Usage] | None = None
+        while acquired is None:
             async with self._admin_changed:
                 wakes = [
                     r.cooldown_until
@@ -1020,8 +1016,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             if delay > 0:
                 await self._race_wait_pulse(delay)
             acquired = await self._acquire(request_id)
-            if acquired is not None:
-                return acquired
+        return acquired
 
     async def _on_ok(self, usage: Usage) -> None:
         """Resource is operational. Reset cooldown state.
@@ -1190,7 +1185,9 @@ class Pool(AgentReadableMixin, Generic[T]):
                 if not t.done():
                     t.cancel()
 
-    async def _sleep_before_retry(self, retry_delay: float, deadline: float | None) -> None:
+    async def _sleep_before_retry(
+        self, retry_delay: float, deadline: float | None
+    ) -> None:
         """Pause between attempts without sleeping past the deadline.
 
         The pause is jittered to ``retry_delay * uniform(0.5, 1.5)`` so concurrent
