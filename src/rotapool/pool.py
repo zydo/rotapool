@@ -100,6 +100,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         strategy: Strategy = "round_robin",
         on_state_change: Callable[[str, ResourceStatus, ResourceStatus], None]
         | None = None,
+        cancel_siblings: bool = True,
     ) -> None:
         """Construct a pool over a set of interchangeable resources.
 
@@ -162,6 +163,15 @@ class Pool(AgentReadableMixin, Generic[T]):
             lock-free). An exception raised by the hook is logged to the
             ``rotapool`` logger and swallowed; monitoring must not break
             failover. Do not use it as a metrics bus.
+
+        cancel_siblings: when True (default), a cooldown or disable *signal*
+            cancels strictly-younger in-flight usages on the same resource so
+            they can retry elsewhere. When False, those younger usages run to
+            completion and deliver their own result to their own caller.
+            Administrative ``disable()`` never cancels in-flight work, regardless
+            of this flag. Sibling cancellation is at-least-once: the cancelled
+            operation may already have reached the backend, so non-idempotent
+            operations MUST set this to False.
         """
         # resource_id -> resource
         self._resources: dict[str, Resource[T]] = self._build_resources(resources)
@@ -195,6 +205,13 @@ class Pool(AgentReadableMixin, Generic[T]):
             )
         self._on_state_change = on_state_change
 
+        if type(cancel_siblings) is not bool:
+            raise TypeError(
+                "cancel_siblings must be bool, got "
+                f"{type(cancel_siblings).__name__}"
+            )
+        self._cancel_siblings: bool = cancel_siblings
+
         # Monotonic counters live on the pool, not on Resource (two pools may
         # share Resource objects). Resource counters are membership-scoped;
         # pool counters survive remove().
@@ -222,6 +239,22 @@ class Pool(AgentReadableMixin, Generic[T]):
         # monotonic timestamps can tie on fast acquisitions; cancellation semantics
         # need a deterministic "younger than" relation.
         self._next_acquisition_order: int = 0
+
+        # Test-only: set `_now` / `_sleep` to override time.monotonic and
+        # asyncio.sleep (conformance virtual clock). Unset in production so
+        # tests that monkeypatch asyncio.sleep still hit the real call site.
+        self._wait_pulse: asyncio.Event = asyncio.Event()
+
+    def _timestamp(self) -> float:
+        now = getattr(self, "_now", None)
+        return now() if callable(now) else time.monotonic()
+
+    async def _sleep_for(self, delay: float) -> None:
+        sleep = getattr(self, "_sleep", None)
+        if callable(sleep):
+            await sleep(delay)
+        else:
+            await asyncio.sleep(delay)
 
     async def run(
         self,
@@ -341,7 +374,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         last_error: BaseException | None = None
 
         for attempt_num in range(effective_attempts):
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline is not None and self._timestamp() >= deadline:
                 raise PoolExhausted(f"deadline exceeded after {attempt_num} attempt(s)")
 
             acquired = await self._acquire(rid)
@@ -491,7 +524,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         ``time.monotonic()`` reading, not a scrape timestamp). For counters
         and Prometheus-ready gauges, use :meth:`stats`.
         """
-        now = time.monotonic()
+        now = self._timestamp()
         result: dict[str, dict[str, Any]] = {}
         for rid, r in list(self._resources.items()):  # noqa: S7504
             status, inflight, cooldown_remaining = self._resource_gauges(r, now)
@@ -515,7 +548,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         ``add()``. Does not include ``last_acquired_at`` -- that value is
         process-monotonic and is not a scrape timestamp.
         """
-        now = time.monotonic()
+        now = self._timestamp()
         resources: dict[str, ResourceStats] = {}
         in_flight = 0
         eligible = 0
@@ -618,6 +651,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             self._resource_counters[resource.resource_id] = _ResourceCounters()
             self._resources[resource.resource_id] = resource
             self._admin_changed.notify_all()
+            self._wait_pulse.set()
         return resource
 
     async def enable(self, resource_id: str) -> None:
@@ -640,6 +674,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             resource.consecutive_cooldown = 0
             self._set_resource_status_locked(resource, "healthy")
             self._admin_changed.notify_all()
+            self._wait_pulse.set()
 
     async def disable(self, resource_id: str) -> None:
         """Administratively remove a resource from selection until ``enable()``.
@@ -657,6 +692,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             resource = self._get_resource(resource_id)
             self._set_resource_status_locked(resource, "disabled")
             self._admin_changed.notify_all()
+            self._wait_pulse.set()
 
     async def remove(self, resource_id: str) -> None:
         """Drop a resource from the pool entirely -- the counterpart to ``add()``.
@@ -694,6 +730,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             del self._resources[resource_id]
             self._resource_counters.pop(resource_id, None)
             self._admin_changed.notify_all()
+            self._wait_pulse.set()
 
     def _get_resource(self, resource_id: str) -> Resource[T]:
         resource = self._resources.get(resource_id)
@@ -766,7 +803,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         registration share one lock acquisition to keep the derived in-flight count
         consistent.
         """
-        now = time.monotonic()
+        now = self._timestamp()
 
         async with self._lock:
             candidates: list[Resource[T]] = []
@@ -865,14 +902,10 @@ class Pool(AgentReadableMixin, Generic[T]):
                 target = wake + retry_delay * random.uniform(0.0, 1.0)
                 if deadline is not None:
                     target = min(target, deadline)
-                try:
-                    # Releases the lock while waiting; reacquires before returning.
-                    await asyncio.wait_for(
-                        self._admin_changed.wait(),
-                        timeout=max(target - time.monotonic(), 0.0),
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                delay = max(target - self._timestamp(), 0.0)
+                self._wait_pulse.clear()
+            if delay > 0:
+                await self._race_wait_pulse(delay)
             acquired = await self._acquire(request_id)
             if acquired is not None:
                 return acquired
@@ -910,7 +943,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         cooldown_seconds: explicit duration (e.g. from a Retry-After header). If None,
             falls back to this pool's cooldown_table.
         """
-        now = time.monotonic()
+        now = self._timestamp()
         to_cancel: list[Usage] = []
 
         async with self._lock:
@@ -944,12 +977,13 @@ class Pool(AgentReadableMixin, Generic[T]):
             if rc is not None:
                 rc.cooldowns += 1
 
-            to_cancel = self._collect_younger_usages_locked(usage)
-            n_cancel = len(to_cancel)
-            if n_cancel:
-                self._pool_counters.sibling_cancels += n_cancel
-                if rc is not None:
-                    rc.sibling_cancels += n_cancel
+            if self._cancel_siblings:
+                to_cancel = self._collect_younger_usages_locked(usage)
+                n_cancel = len(to_cancel)
+                if n_cancel:
+                    self._pool_counters.sibling_cancels += n_cancel
+                    if rc is not None:
+                        rc.sibling_cancels += n_cancel
 
         self._cancel_tasks(to_cancel)
 
@@ -968,7 +1002,8 @@ class Pool(AgentReadableMixin, Generic[T]):
             if resource is not None:
                 self._set_resource_status_locked(resource, "disabled")
 
-            to_cancel = self._collect_younger_usages_locked(usage)
+            if self._cancel_siblings:
+                to_cancel = self._collect_younger_usages_locked(usage)
             n_cancel = len(to_cancel)
             if n_cancel:
                 self._pool_counters.sibling_cancels += n_cancel
@@ -1012,8 +1047,31 @@ class Pool(AgentReadableMixin, Generic[T]):
                 to_cancel.append(other)
         return to_cancel
 
-    @staticmethod
-    async def _sleep_before_retry(retry_delay: float, deadline: float | None) -> None:
+    async def _race_wait_pulse(self, delay: float) -> None:
+        """Wait for admin pulse or ``delay`` seconds, whichever first.
+
+        Used instead of ``Condition.wait`` + ``wait_for`` so tests can inject
+        ``_sleep`` (virtual time) without blocking on loop wall-clock timeouts.
+        """
+        sleep_t = asyncio.create_task(self._sleep_for(delay))
+        pulse_t = asyncio.create_task(self._wait_pulse.wait())
+        try:
+            _done, pending = await asyncio.wait(
+                {sleep_t, pulse_t}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+            for t in pending:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            for t in (sleep_t, pulse_t):
+                if not t.done():
+                    t.cancel()
+
+    async def _sleep_before_retry(self, retry_delay: float, deadline: float | None) -> None:
         """Pause between attempts without sleeping past the deadline.
 
         The pause is jittered to ``retry_delay * uniform(0.5, 1.5)`` so concurrent
@@ -1027,8 +1085,8 @@ class Pool(AgentReadableMixin, Generic[T]):
         """
         delay = retry_delay * random.uniform(0.5, 1.5)
         if deadline is not None:
-            delay = min(delay, max(deadline - time.monotonic(), 0.0))
-        await asyncio.sleep(delay)
+            delay = min(delay, max(deadline - self._timestamp(), 0.0))
+        await self._sleep_for(delay)
 
     @staticmethod
     def _cancel_tasks(usages: list[Usage]) -> None:
@@ -1212,8 +1270,9 @@ N ``run()`` invocations.
 ### Gotcha
 
 Cooldown/disable cancels YOUNGER in-flight usages on the same resource and
-retries them elsewhere; OLDER usages run to completion (they may already
-have side effects upstream). ``asyncio.CancelledError`` from sibling
+retries them elsewhere unless ``cancel_siblings=False``; OLDER usages run to
+completion (they may already have side effects upstream). The default is
+at-least-once: cancelled work may already have reached the backend. ``asyncio.CancelledError`` from sibling
 cancellation is swallowed and retried; only OUTER caller cancellation
 propagates. Rare edge: an outer cancel landing in the same event-loop
 tick as an internal sibling cancel is classified internal and absorbed

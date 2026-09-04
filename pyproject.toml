@@ -78,4 +78,5 @@ dev = [
     "ruff>=0.10",
     "pyright==1.1.411",
     "prometheus_client>=0.17",
+    "pyyaml>=6.0.3",
 ]

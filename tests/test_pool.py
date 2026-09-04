@@ -880,6 +880,45 @@ class TestCancellation:
 
         assert pool.snapshot()["r0"]["in_flight"] == 0
 
+    async def test_e9_cancel_siblings_false_younger_completes(self) -> None:
+        """cancel_siblings=False: younger in-flight usage is not cancelled and
+        returns success to its own caller (SPEC CANCEL-07).
+        """
+        pool = Pool(
+            resources=_res(2),
+            max_attempts=1,
+            cooldown_table=FAST_TABLE,
+            strategy="primary_backup",
+            cancel_siblings=False,
+        )
+        older_hold = asyncio.Event()
+        younger_hold = asyncio.Event()
+        younger_started = asyncio.Event()
+
+        async def older_body(r: Resource[str]) -> str:
+            await older_hold.wait()
+            raise CooldownResource(reason="hot")
+
+        async def younger_body(r: Resource[str]) -> str:
+            younger_started.set()
+            await younger_hold.wait()
+            return r.value
+
+        older_t = asyncio.create_task(pool.run(older_body))
+        await asyncio.sleep(0)
+        younger_t = asyncio.create_task(pool.run(younger_body))
+        await younger_started.wait()
+        assert pool.snapshot()["r0"]["in_flight"] == 2
+
+        older_hold.set()
+        with pytest.raises(PoolExhausted):
+            await older_t
+        younger_hold.set()
+        assert await younger_t == "v0"
+        assert pool.stats().sibling_cancels == 0
+        assert pool.stats().runs_ok == 1
+        assert pool.stats().runs_exhausted == 1
+
 
 # ===================================================================
 # Group F — Concurrency & saturation

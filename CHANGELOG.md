@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Pool(..., cancel_siblings=True)` -- when False, cooldown/disable signals
+  do not cancel younger in-flight usages on the same resource. Default True
+  matches 0.4.0. Non-idempotent operations should pass False (at-least-once
+  sibling cancellation).
+
 ## [0.4.0] - 2026-09-02
 
 ### Added

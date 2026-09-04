@@ -19,6 +19,12 @@ Async resource pool with inline health feedback, automatic cooldown, and retry -
 > npx skills add zydo/skills --skill agent-readable
 > ```
 
+rotapool provides **at-least-once** execution semantics. When a usage signals
+cooldown or disable, younger in-flight usages on the same resource are
+cancelled and retried elsewhere; those cancelled operations MAY already have
+reached the backend. Operations MUST be idempotent, or you MUST construct the
+pool with `cancel_siblings=False`.
+
 ## Install
 
 ```bash

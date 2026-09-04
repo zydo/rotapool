@@ -65,7 +65,9 @@ pool = Pool(
 
 ## In-Flight Cancellation
 
-When a resource receives a `CooldownResource` or `DisableResource` signal, the framework cancels younger in-flight usages on the same resource. Older usages are left alone -- they may still succeed. This maximizes throughput while avoiding doomed requests.
+When a resource receives a `CooldownResource` or `DisableResource` signal, the framework cancels younger in-flight usages on the same resource **if** `cancel_siblings=True` (the default). Older usages are left alone -- they may still succeed. This maximizes throughput while avoiding doomed requests. Pass `cancel_siblings=False` to let younger usages run to completion; rotapool then provides at-least-once execution only for the signalling usage's own retries, not for cancelled siblings.
+
+rotapool provides **at-least-once** execution when sibling cancellation is on: a cancelled operation MAY already have produced side effects upstream. Operations that are not idempotent MUST set `cancel_siblings=False`.
 
 Cancellation is best-effort: it works when the operation returns a coroutine (the framework wraps it in an `asyncio.Task`) or an `asyncio.Future` (cancelled directly). For plain awaitables with no `.cancel()` handle, cancellation silently no-ops for that usage and it runs to natural completion. Within a coroutine, the underlying I/O is only truly aborted if the operation uses cancellation-aware async libraries such as `httpx.AsyncClient` or `aiohttp`.
 

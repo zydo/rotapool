@@ -44,6 +44,15 @@ pool = Pool(
     #                  async methods (snapshot() and stats() are safe -- lock-free).
     #                  Exceptions are logged to the "rotapool" logger and swallowed.
     #                  Do not use it as a metrics bus.
+
+    cancel_siblings: bool = True,
+    # cancel_siblings: When True (default), a CooldownResource / DisableResource
+    #                  signal cancels strictly-younger in-flight usages on the same
+    #                  resource so they retry elsewhere. When False, those usages run
+    #                  to completion. Admin disable() never cancels in-flight work.
+    #                  Cancellation is at-least-once: the cancelled operation may
+    #                  already have reached the backend. Non-idempotent operations
+    #                  MUST pass False.
 )
 ```
 
