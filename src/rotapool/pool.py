@@ -107,6 +107,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         strategy: Strategy = "round_robin",
         on_state_change: Callable[..., None] | None = None,
         cancel_siblings: bool = True,
+        probe_on_recovery: bool = False,
     ) -> None:
         """Construct a pool over a set of interchangeable resources.
 
@@ -179,6 +180,12 @@ class Pool(AgentReadableMixin, Generic[T]):
             of this flag. Sibling cancellation is at-least-once: the cancelled
             operation may already have reached the backend, so non-idempotent
             operations MUST set this to False.
+
+        probe_on_recovery: when True, a resource whose cooldown has just expired
+            is admitted with an effective ``max_in_flight`` of 1 until a success
+            (half-open probe). A failed probe re-enters cooldown and advances
+            escalation. Default False: expiry restores the configured cap for
+            every caller at once.
         """
         # resource_id -> resource
         self._resources: dict[str, Resource[T]] = self._build_resources(resources)
@@ -223,6 +230,14 @@ class Pool(AgentReadableMixin, Generic[T]):
                 f"{type(cancel_siblings).__name__}"
             )
         self._cancel_siblings: bool = cancel_siblings
+
+        if type(probe_on_recovery) is not bool:
+            raise TypeError(
+                "probe_on_recovery must be bool, got "
+                f"{type(probe_on_recovery).__name__}"
+            )
+        self._probe_on_recovery: bool = probe_on_recovery
+        self._probing: set[str] = set()
 
         # Monotonic counters live on the pool, not on Resource (two pools may
         # share Resource objects). Resource counters are membership-scoped;
@@ -607,9 +622,10 @@ class Pool(AgentReadableMixin, Generic[T]):
             resources[rid] = rs
             in_flight += inflight
             by_status[status] += 1
-            if rs.eligible:
+            cap = self._effective_max_in_flight(r)
+            if status == "healthy" and (cap is None or inflight < cap):
                 eligible += 1
-            if rs.saturated:
+            if status == "healthy" and cap is not None and inflight >= cap:
                 saturated += 1
 
         pc = self._pool_counters
@@ -648,6 +664,12 @@ class Pool(AgentReadableMixin, Generic[T]):
             max(r.cooldown_until - now, 0.0) if status == "cooling_down" else 0.0
         )
         return status, inflight, cooldown_remaining
+
+    def _effective_max_in_flight(self, r: Resource[T]) -> int | None:
+        if r.resource_id in self._probing:
+            configured = r.max_in_flight
+            return 1 if configured is None else min(configured, 1)
+        return r.max_in_flight
 
     async def add(
         self,
@@ -726,6 +748,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             # callback (if any) observes the fully-recovered resource.
             resource.cooldown_until = 0.0
             resource.consecutive_cooldown = 0
+            self._probing.discard(resource.resource_id)
             self._set_resource_status_locked(resource, "healthy")
             self._admin_changed.notify_all()
             self._wait_pulse.set()
@@ -785,6 +808,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             # id, never a ghost series for a removed one.
             del self._resources[resource_id]
             self._resource_counters.pop(resource_id, None)
+            self._probing.discard(resource_id)
             self._admin_changed.notify_all()
             self._wait_pulse.set()
 
@@ -899,11 +923,14 @@ class Pool(AgentReadableMixin, Generic[T]):
                 if r.status == "cooling_down":
                     if r.cooldown_until <= now:
                         self._set_resource_status_locked(r, "healthy")
+                        if self._probe_on_recovery:
+                            self._probing.add(r.resource_id)
                     else:
                         continue
 
                 current = len(self._inflight_by_resource.get(r.resource_id, set()))
-                if r.max_in_flight is not None and current >= r.max_in_flight:
+                cap = self._effective_max_in_flight(r)
+                if cap is not None and current >= cap:
                     continue
 
                 candidates.append(r)
@@ -1017,6 +1044,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             if resource is not None and resource.status == "healthy":
                 resource.cooldown_until = 0.0
                 resource.consecutive_cooldown = 0
+                self._probing.discard(usage.resource_id)
 
     async def _on_cooldown(
         self, usage: Usage, cooldown_seconds: float | None = None
@@ -1048,6 +1076,7 @@ class Pool(AgentReadableMixin, Generic[T]):
 
                 resource.status = "cooling_down"
                 resource.cooldown_until = max(resource.cooldown_until, now + cd)
+                self._probing.discard(resource.resource_id)
 
                 # Delivered even when old_status is already "cooling_down": an
                 # escalation or extension changes magnitude, not status, and the

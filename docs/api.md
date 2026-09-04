@@ -44,6 +44,10 @@ pool = Pool(
     #                  Exceptions are logged to the "rotapool" logger and swallowed.
     #                  Do not use it as a metrics bus.
 
+    probe_on_recovery: bool = False,
+    # probe_on_recovery: When True, cooldown expiry admits the resource with
+    #                  effective max_in_flight=1 until a success. Default False.
+
     cancel_siblings: bool = True,
     # cancel_siblings: When True (default), a CooldownResource / DisableResource
     #                  signal cancels strictly-younger in-flight usages on the same

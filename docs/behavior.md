@@ -54,6 +54,8 @@ Each consecutive `CooldownResource` from the same resource escalates the cooldow
 
 You can override per event: `CooldownResource(cooldown_seconds=5)`, for example from a `Retry-After` header. The counter resets on the next success. An explicit cooldown is a floor, not a replacement: the new expiry is `max(current, now + seconds)`, so a short `Retry-After` never shortens a longer cooldown that is already running on that resource.
 
+Pass `probe_on_recovery=True` to admit an expired resource with effective `max_in_flight=1` until a success (half-open). The default is off: expiry restores the configured cap for every caller at once.
+
 Custom tables are supported per pool:
 
 ```python

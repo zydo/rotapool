@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `wait_for_cooldown=True` no longer clamps the attempt budget to the
   resource count, so a single-resource pool can wait out its own cooldown
   within `max_attempts`.
+- `probe_on_recovery=False` (default): cooldown expiry restores configured
+  cap. When True, expiry is half-open (effective cap 1 until a success).
 
 ## [0.4.0] - 2026-09-02
 

@@ -1675,6 +1675,63 @@ class TestWaitForCooldown:
             await pool.run(op_fail, wait_for_cooldown=False, retry_delay=0, max_attempts=3)
         assert n2["i"] == 1
 
+    async def test_i10_probe_on_recovery_limits_to_one(self) -> None:
+        clock = _VirtualClock()
+        pool = Pool(
+            resources=[
+                Resource(resource_id="r0", value="v0", max_in_flight=10),
+                Resource(resource_id="r1", value="v1"),
+            ],
+            cooldown_table=(5.0,),
+            strategy="primary_backup",
+            probe_on_recovery=True,
+            max_attempts=3,
+        )
+        pool._now = clock.now  # noqa: SLF001
+        pool._sleep = clock.sleep  # noqa: SLF001
+
+        async def cool(_: Resource[str]) -> str:
+            raise CooldownResource(cooldown_seconds=5.0)
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cool, max_attempts=1)
+        clock.advance(5)
+        hold = asyncio.Event()
+        hits: list[str] = []
+
+        async def hold_body(r: Resource[str]) -> str:
+            hits.append(r.resource_id)
+            await hold.wait()
+            return r.value
+
+        tasks = [asyncio.create_task(pool.run(hold_body, retry_delay=0)) for _ in range(10)]
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if len(hits) >= 10:
+                break
+        assert hits.count("r0") == 1
+        assert hits.count("r1") == 9
+        hold.set()
+        await asyncio.gather(*tasks)
+
+        # After a probe success, configured cap is restored.
+        hits.clear()
+        hold2 = asyncio.Event()
+
+        async def hold2_body(r: Resource[str]) -> str:
+            hits.append(r.resource_id)
+            await hold2.wait()
+            return r.value
+
+        tasks = [asyncio.create_task(pool.run(hold2_body, retry_delay=0)) for _ in range(10)]
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if len(hits) >= 10:
+                break
+        assert hits.count("r0") == 10
+        hold2.set()
+        await asyncio.gather(*tasks)
+
 
 # ===================================================================
 # Group J — Admin enable / disable
