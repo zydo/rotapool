@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `probe_on_recovery=False` (default): cooldown expiry restores configured
   cap. When True, expiry is half-open (effective cap 1 until a success).
 
+### Notes
+
+- Omitting `request_id` on `run()` still auto-generates a UUID in 0.5.
+  0.6 may stop; `@pool.use()` still does not forward `request_id`.
+
 ## [0.4.0] - 2026-09-02
 
 ### Added

@@ -101,10 +101,14 @@ await pool.run(
     #                  after the deadline. The wake-up is jittered by an extra
     #                  retry_delay * uniform(0, 1), capped by the deadline, to avoid
     #                  waiter stampedes at the expiry instant. False = fail fast (default).
+    #                  Admin add() / enable() / disable() / remove() wake waiters so
+    #                  they re-evaluate immediately.
 
     request_id: str | None = None,
     # request_id:      Opaque string attached to every Usage created by this call.
-    #                  Auto-generated UUID when None.
+    #                  Auto-generated UUID when None. 0.5 keeps this default; 0.6
+    #                  may stop auto-generating (omitted request_id would then be
+    #                  empty). @pool.use() does not forward request_id.
 ) -> R
 ```
 
@@ -158,8 +162,8 @@ pool.stats() -> PoolStats
 #   eligible: int                            # healthy and under max_in_flight
 #   saturated: int                           # healthy and at max_in_flight
 #   by_status: dict[status, int]             # always all three keys, zeros included
-#   attempts, successes, cooldowns, disables, sibling_cancels: int  # lifetime
-#   runs_ok, runs_exhausted, runs_error, runs_cancelled: int        # lifetime
+#   attempts, successes, cooldowns, disables, sibling_cancels, retries: int  # lifetime
+#   runs_ok, runs_exhausted, runs_error, runs_cancelled: int                 # lifetime
 #
 # ResourceStats
 #   status, in_flight, max_in_flight, consecutive_cooldown,
@@ -322,6 +326,7 @@ Frozen metric names (changing them is a dashboard-breaking change):
 | `rotapool_cooldowns_total`                     | counter                     | `pool`                                                         |
 | `rotapool_disables_total`                      | counter                     | `pool`                                                         |
 | `rotapool_sibling_cancels_total`               | counter                     | `pool`                                                         |
+| `rotapool_retries_total`                       | counter                     | `pool`                                                         |
 | `rotapool_in_flight`                           | gauge                       | `pool`                                                         |
 | `rotapool_eligible`                            | gauge                       | `pool`                                                         |
 | `rotapool_saturated`                           | gauge                       | `pool`                                                         |

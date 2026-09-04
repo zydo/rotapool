@@ -3,9 +3,13 @@
 [![CI](https://github.com/zydo/rotapool/actions/workflows/ci.yml/badge.svg)](https://github.com/zydo/rotapool/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/rotapool.svg)](https://pypi.org/project/rotapool/)
 
-Async resource pool with inline health feedback, automatic cooldown, and retry -- for API keys, proxies, GPU workers, or anything that can rate-limit you or go down.
+Generic async resource pool with health-aware selection, cooldown, and retry
 
-`rotapool` is designed for resources where every call is also useful health evidence. Instead of relying on a separate prober, callers signal whether the selected resource should stay healthy, cool down temporarily, or be disabled.
+A pool of arbitrary resources — API keys, OAuth credentials, proxy URLs, HTTP
+clients, LLM providers, inference or RPC endpoints, browser sessions, GPU
+workers — that rotates across them as they become unhealthy. Every call is
+also health evidence: callers signal whether the selected resource should stay
+healthy, cool down temporarily, or be disabled.
 
 | Signal                              | Meaning                                |
 | ----------------------------------- | -------------------------------------- |
@@ -26,6 +30,13 @@ cancelled and retried elsewhere; those cancelled operations MAY already have
 reached the backend. Operations MUST be idempotent, or you MUST construct the
 pool with `cancel_siblings=False`.
 
+## What it is not
+
+- **not a database connection pool** -- resources are not checked out and returned; a resource serves many concurrent usages simultaneously.
+- **not a generic object-leasing pool** -- there is no lease/return model.
+- **not merely a rate limiter** -- health feedback comes from your operation's outcome, not a token bucket.
+- **not merely a retry library** -- retry selection is health-aware and per-resource, with cooldown escalation and sibling cancellation.
+
 ## Install
 
 ```bash
@@ -41,7 +52,9 @@ Requires Python 3.10+. Zero runtime dependencies. Optional extras: `pip install 
 ```python
 import httpx
 
-from rotapool import CooldownResource, DisableResource, Pool, Resource
+from rotapool import CooldownResource, DisableResource, Pool, Resource, RetryOperation
+
+client = httpx.AsyncClient()
 
 pool = Pool(
     resources=[
@@ -53,14 +66,15 @@ pool = Pool(
     cooldown_table=(30.0, 120.0, 300.0, 600.0),
 )
 
-@pool.use()
 async def call_upstream(resource, url, payload):
-    async with httpx.AsyncClient() as client:
+    try:
         resp = await client.post(
             url,
             headers={"Authorization": f"Bearer {resource.value}"},
             json=payload,
         )
+    except httpx.TransportError:
+        raise RetryOperation(reason="transport")
 
     if resp.status_code == 429:
         raise CooldownResource(reason="rate limited")
@@ -69,10 +83,17 @@ async def call_upstream(resource, url, payload):
 
     return resp.json()
 
-result = await call_upstream("https://api.example.com/v1/chat", {"prompt": "hi"})
+result = await pool.run(
+    lambda resource: call_upstream(
+        resource, "https://api.example.com/v1/chat", {"prompt": "hi"}
+    ),
+)
 ```
 
-Runnable versions of this (no httpx) and of the Prometheus extra live in [`examples/`](examples/).
+The HTTP client lives **outside** the operation and is captured by the
+closure. `@pool.use()` is a decorator shim over `pool.run()`; see
+[usage](docs/usage.md). Runnable versions of this (no httpx) and of the
+Prometheus extra live in [`examples/`](examples/).
 
 ## Documentation
 
@@ -89,6 +110,7 @@ Runnable versions of this (no httpx) and of the Prometheus extra live in [`examp
 - Each `run()` attempt receives one selected `Resource`.
 - Raising `CooldownResource` marks that resource temporarily unavailable and retries elsewhere when possible.
 - Raising `DisableResource` removes that resource from selection until `enable()` is called.
+- Raising `RetryOperation` retries without cooldown or sibling cancel.
 - Any other exception is treated as caller or business failure, not resource failure, and propagates.
 - `@pool.use()` is a decorator convenience over `pool.run()`.
 

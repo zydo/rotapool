@@ -106,7 +106,7 @@ There are three surfaces; they do different jobs.
 
 `stats()` is the metrics view. Gauges are Prometheus-ready: numeric, `by_status` always contains all three status keys (including zeros), `ResourceStats.status_one_hot()` is a 0/1 series per state, and `max_in_flight_gauge` is `+Inf` when unbounded. It does not include `last_acquired_at`. Counters only increase:
 
-- **Pool-level** (`attempts`, `successes`, `cooldowns`, `disables`, `sibling_cancels`, and `runs_*` by outcome) are process-lifetime and survive `remove()`. Never reconstruct them by summing per-resource counters -- that would drop on membership change and break Prometheus `rate()`.
+- **Pool-level** (`attempts`, `successes`, `cooldowns`, `disables`, `sibling_cancels`, `retries`, and `runs_*` by outcome) are process-lifetime and survive `remove()`. Never reconstruct them by summing per-resource counters -- that would drop on membership change and break Prometheus `rate()`.
 - **Per-resource** counters are membership-scoped: `remove()` drops the series; `add()` of the same id starts at 0.
 
 `runs_ok` is a normal return, `runs_exhausted` is `PoolExhausted`, `runs_error` is any other exception from the operation (the resource is still marked healthy), and `runs_cancelled` is outer caller cancellation. Constructor / argument `ValueError` is not a run and is not counted. `cooldowns` counts every `CooldownResource` event, including escalations (`cooling_down -> cooling_down`). `disables` counts real transitions to disabled (signal or admin), not no-op admin calls.

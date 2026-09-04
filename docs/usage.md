@@ -42,13 +42,15 @@ pool = Pool(
     ],
     max_attempts=3,                              # Total retry budget per run() call (capped at len(resources))
     cooldown_table=(30.0, 120.0, 300.0, 600.0),  # Escalation: 1st=30s, 2nd=120s, 3rd=300s, 4th+=600s
+    # strategy="round_robin",                    # default: fewest in-flight first, then oldest last_acquired_at
 )
 ```
 
 ## Option 1: Use the Decorator
 
 ```python
-# Resource selection happens automatically per the pool's strategy (round_robin by default).
+# Resource selection happens automatically per the pool's strategy
+# (`round_robin` by default: fewest in-flight first, then oldest last_acquired_at).
 # All parameters are optional and forward to pool.run() on every call.
 @pool.use(
     max_attempts=None,         # Override the pool's max_attempts for this decorated function
@@ -83,7 +85,7 @@ A script that runs both this decorator and `pool.run()` without httpx is [`examp
 
 ## Option 2: Direct `run()`
 
-`@pool.use()` is a thin shim over `pool.run()`, but it only accepts the policy knobs that are safe to fix at decoration time (`max_attempts`, `deadline`, `retry_delay`, `wait_for_cooldown`). Anything that needs to vary per call must go through `run()` directly -- most notably `request_id`, which is meant to correlate with caller-side context, such as an inbound HTTP request id, and would be wrong to bake into the decorator.
+`@pool.use()` is a thin shim over `pool.run()`, but it only accepts the policy knobs that are safe to fix at decoration time (`max_attempts`, `deadline`, `retry_delay`, `wait_for_cooldown`). Anything that needs to vary per call must go through `run()` directly -- most notably `request_id`, which is meant to correlate with caller-side context, such as an inbound HTTP request id, and would be wrong to bake into the decorator. Omitting `request_id` on `run()` auto-generates a UUID in 0.5; 0.6 may stop doing that.
 
 Use `run()` directly when you want per-call overrides or when the call site cannot be decorated:
 
@@ -110,7 +112,7 @@ result = await pool.run(
     deadline=time.monotonic() + 30, # Gates the start of each attempt (not in-flight work); None = no deadline
     retry_delay=0.5,                # Base pause between failed attempts (jittered +/-50%)
     wait_for_cooldown=False,        # Wait out the earliest cooldown instead of failing fast
-    request_id="req-abc",           # Opaque string attached to every Usage; auto-UUID when None
+    request_id="req-abc",           # Opaque string attached to every Usage; auto-UUID when None (0.6 may stop)
 )
 ```
 
