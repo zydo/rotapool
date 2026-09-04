@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `on_state_change` is invoked after the pool lock is released. A fourth
   monotonic `seq` argument is accepted; 3-parameter hooks still work with a
   `DeprecationWarning`.
+- Internally cancelled attempts that exhaust the budget surface a
+  `CooldownResource` / `DisableResource` as the last error, not
+  `CancelledError`.
+- Applying a cooldown signal wakes `wait_for_cooldown` sleepers so they
+  recompute the earliest expiry.
 
 ## [0.4.0] - 2026-09-02
 

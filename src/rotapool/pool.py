@@ -452,7 +452,17 @@ class Pool(AgentReadableMixin, Generic[T]):
                 usage.status = "cancelled"
                 if not cancelled_internally:
                     raise
-                last_error = asyncio.CancelledError()
+                # SPEC CANCEL-03: exhausted last-error is the health signal
+                # that cancelled us, not a raw CancelledError.
+                res = self._resources.get(usage.resource_id)
+                if res is not None and res.status == "disabled":
+                    last_error = DisableResource(
+                        reason="cancelled by a sibling usage failure"
+                    )
+                else:
+                    last_error = CooldownResource(
+                        reason="cancelled by a sibling usage failure"
+                    )
                 if attempt_num < effective_attempts - 1:
                     await self._sleep_before_retry(retry_delay, deadline)
                 continue
@@ -1020,6 +1030,8 @@ class Pool(AgentReadableMixin, Generic[T]):
                         self._pool_counters.sibling_cancels += n_cancel
                         if rc is not None:
                             rc.sibling_cancels += n_cancel
+                self._admin_changed.notify_all()
+                self._wait_pulse.set()
 
         self._flush_state_change_events()
         self._cancel_tasks(to_cancel)

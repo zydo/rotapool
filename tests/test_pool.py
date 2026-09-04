@@ -46,6 +46,45 @@ from rotapool.models import RESOURCE_STATUSES, Usage
 
 FAST_TABLE = (0.05, 0.10, 0.15, 0.20)
 
+
+class _VirtualClock:
+    def __init__(self) -> None:
+        self.t = 0.0
+        self._sleepers: list[tuple[float, asyncio.Future[None]]] = []
+
+    def now(self) -> float:
+        return self.t
+
+    @property
+    def n_sleepers(self) -> int:
+        return sum(1 for _, fut in self._sleepers if not fut.done())
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+        left: list[tuple[float, asyncio.Future[None]]] = []
+        for when, fut in self._sleepers:
+            if fut.done():
+                continue
+            if when <= self.t:
+                fut.set_result(None)
+            else:
+                left.append((when, fut))
+        self._sleepers = left
+
+    async def sleep(self, delay: float) -> None:
+        if delay <= 0:
+            await asyncio.sleep(0)
+            return
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        self._sleepers.append((self.t + delay, fut))
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if not fut.done():
+                fut.cancel()
+            raise
+
 _T = TypeVar("_T")
 
 # Strong-ref set so the body tasks driving futures are not GC'd before they resolve.
@@ -919,6 +958,41 @@ class TestCancellation:
         assert pool.stats().runs_ok == 1
         assert pool.stats().runs_exhausted == 1
 
+    async def test_e10_internal_cancel_exhausted_last_error_is_signal(self) -> None:
+        """SPEC CANCEL-03: when sibling cancel consumes the last attempt, the
+        PoolExhausted message carries a cooldown/disable signal, not CancelledError.
+        """
+        pool = Pool(
+            resources=_res(1),
+            max_attempts=1,
+            cooldown_table=FAST_TABLE,
+        )
+        older_hold = asyncio.Event()
+        younger_started = asyncio.Event()
+
+        async def older_body(_: Resource[str]) -> str:
+            await older_hold.wait()
+            raise CooldownResource(reason="hot")
+
+        async def younger_body(_: Resource[str]) -> str:
+            younger_started.set()
+            await asyncio.Event().wait()
+            return "never"
+
+        older_t = asyncio.create_task(pool.run(older_body))
+        await asyncio.sleep(0)
+        younger_t = asyncio.create_task(pool.run(younger_body))
+        await younger_started.wait()
+        older_hold.set()
+        with pytest.raises(PoolExhausted) as ei:
+            await older_t
+        with pytest.raises(PoolExhausted) as ey:
+            await younger_t
+        assert "CancelledError" not in repr(ey.value)
+        assert "cancelled by a sibling" in repr(ey.value)
+        assert "CooldownResource" in repr(ey.value)
+        assert "CancelledError" not in repr(ei.value)
+
 
 # ===================================================================
 # Group F — Concurrency & saturation
@@ -1475,6 +1549,58 @@ class TestWaitForCooldown:
         with pytest.raises(PoolExhausted, match="no eligible resource"):
             await waiter
         assert time.monotonic() - start < 1.0
+
+    async def test_i8_cooldown_apply_wakes_waiter_to_recompute(self) -> None:
+        """SPEC RETRY-09: applying a cooldown wakes waiters so they recompute
+        expiry instead of sleeping out a stale plan. After an extension, advancing
+        only the original duration must not let the waiter succeed.
+        """
+        clock = _VirtualClock()
+        pool = Pool(resources=_res(1), cooldown_table=(10.0,), max_attempts=1)
+        pool._now = clock.now  # noqa: SLF001
+        pool._sleep = clock.sleep  # noqa: SLF001
+
+        older_hold = asyncio.Event()
+
+        async def older_body(_: Resource[str]) -> str:
+            await older_hold.wait()
+            raise CooldownResource(cooldown_seconds=30.0)
+
+        async def short_cool(_: Resource[str]) -> str:
+            raise CooldownResource(cooldown_seconds=10.0)
+
+        async def ident(r: Resource[str]) -> str:
+            return r.value
+
+        older = asyncio.create_task(pool.run(older_body))
+        await asyncio.sleep(0)
+        with pytest.raises(PoolExhausted):
+            await pool.run(short_cool)
+        waiter = asyncio.create_task(
+            pool.run(ident, wait_for_cooldown=True, retry_delay=0)
+        )
+        for _ in range(100):
+            if clock.n_sleepers:
+                break
+            await asyncio.sleep(0)
+        older_hold.set()
+        with pytest.raises(PoolExhausted):
+            await older
+        for _ in range(50):
+            await asyncio.sleep(0)
+            wakes = [w for w, f in clock._sleepers if not f.done()]  # noqa: SLF001
+            if wakes and min(wakes) >= 29:
+                break
+        else:
+            pytest.fail(
+                f"waiter did not re-sleep until ~30s after extension, "
+                f"sleepers={clock._sleepers}"  # noqa: SLF001
+            )
+        clock.advance(10)
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        await pool.enable("r0")
+        assert await waiter == "v0"
 
 
 # ===================================================================
