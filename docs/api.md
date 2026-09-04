@@ -13,8 +13,9 @@ pool = Pool(
     # max_attempts:    Total retry budget per run() call. Each attempt picks among
     #                  currently eligible resources -- one that triggered cooldown or
     #                  disable stays ineligible while that state lasts (a zero-second
-    #                  cooldown can make it eligible again immediately). Effectively
-    #                  capped at len(resources); raises PoolExhausted once spent.
+    #                  cooldown can make it eligible again immediately). Fail-fast
+    #                  is capped at len(resources); wait_for_cooldown=True uses
+    #                  max_attempts only. Raises PoolExhausted once spent.
 
     cooldown_table: tuple[float, ...] = (30.0, 120.0, 300.0, 600.0),
     # cooldown_table:  Escalation table indexed by consecutive_cooldown count.

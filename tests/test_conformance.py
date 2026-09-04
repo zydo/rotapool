@@ -1,4 +1,4 @@
-"""Drive rotapool-spec/conformance/scenarios.yaml against this implementation."""
+"""Optional scenario table driven by ROTAPOOL_SCENARIOS or conformance/scenarios.yaml."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ def _scenarios_path() -> Path | None:
     if env:
         path = Path(env)
         return path if path.is_file() else None
-    sibling = Path(__file__).resolve().parents[2] / "rotapool-spec/conformance/scenarios.yaml"
-    return sibling if sibling.is_file() else None
+    local = Path(__file__).resolve().parents[1] / "conformance/scenarios.yaml"
+    return local if local.is_file() else None
 
 
 class VirtualClock:
@@ -315,7 +315,7 @@ def _check(actual: dict[str, Any], expect: dict[str, Any]) -> list[str]:
     return errors
 
 
-@pytest.mark.skipif(not _SCENARIOS, reason="rotapool-spec scenarios.yaml not found")
+@pytest.mark.skipif(not _SCENARIOS, reason="scenarios.yaml not found")
 @pytest.mark.parametrize("scenario", _SCENARIOS, ids=lambda s: s["id"])
 async def test_conformance_scenario(scenario: dict[str, Any]) -> None:
     try:

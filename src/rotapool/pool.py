@@ -121,10 +121,11 @@ class Pool(AgentReadableMixin, Generic[T]):
             Each attempt selects a resource via the pool's selection rules; a resource
             that triggered cooldown or disable on one attempt is ineligible on the
             next while that state lasts (a zero-second cooldown can make it eligible
-            again immediately, in which case it may be re-selected). Effective cap is
-            ``min(max_attempts, len(resources))`` -- a budget larger than the pool is
-            pointless, so ``run()`` raises ``PoolExhausted`` once it is spent.
-            Overridable per call via ``run(..., max_attempts=...)``.
+            again immediately, in which case it may be re-selected). In fail-fast
+            mode the effective cap is ``min(max_attempts, len(resources))``. With
+            ``wait_for_cooldown=True`` the cap is ``max_attempts`` only, so a
+            single-resource pool can wait out its own cooldown. Overridable per
+            call via ``run(..., max_attempts=...)``.
 
         cooldown_table: cooldown durations (seconds) indexed by ``consecutive_cooldown``
             count on a resource. Each consecutive ``CooldownResource`` from the same
@@ -312,7 +313,8 @@ class Pool(AgentReadableMixin, Generic[T]):
 
         max_attempts: per-call override of Pool.__init__ max_attempts.
             This is a total budget across resource switches, not per resource.
-            Effective value is ``min(max_attempts, len(resources))``.
+            Fail-fast uses ``min(max_attempts, len(resources))``; with
+            ``wait_for_cooldown=True`` the budget is ``max_attempts`` only.
 
         deadline: absolute time.monotonic() value that gates when each attempt may
             start. It is checked before every attempt and caps both the inter-attempt
