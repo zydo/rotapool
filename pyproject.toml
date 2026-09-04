@@ -1,6 +1,6 @@
 [project]
 name = "rotapool"
-version = "0.4.0"
+version = "0.5.0"
 description = "Generic async resource pool with health-aware selection, cooldown, and retry"
 readme = "README.md"
 license = "MIT"

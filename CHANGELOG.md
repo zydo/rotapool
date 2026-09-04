@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-04
+
 ### Added
 
 - `Pool(..., cancel_siblings=True)` -- when False, cooldown/disable signals
@@ -33,8 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `probe_on_recovery=False` (default): cooldown expiry restores configured
   cap. When True, expiry is half-open (effective cap 1 until a success).
 
+### Fixed
+
+- CI stopped running on branch pushes after 0.4.0 (a `push` trigger with
+  only `tags-ignore` and no `branches` filter). Restored, and with it a
+  clean `ruff`/`pyright` lint and 100% coverage across Python 3.10-3.14.
+
 ### Notes
 
+- The `wait_for_cooldown` sleep now races its timer against the admin wake
+  on a shared future rather than `asyncio.wait`; observable behaviour is
+  unchanged.
 - Omitting `request_id` on `run()` still auto-generates a UUID in 0.5.
   0.6 may stop; `@pool.use()` still does not forward `request_id`.
 
@@ -115,6 +126,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release.
 
+[0.5.0]: https://github.com/zydo/rotapool/releases/tag/v0.5.0
 [0.4.0]: https://github.com/zydo/rotapool/releases/tag/v0.4.0
 [0.3.0]: https://github.com/zydo/rotapool/releases/tag/v0.3.0
 [0.2.2]: https://github.com/zydo/rotapool/releases/tag/v0.2.2
