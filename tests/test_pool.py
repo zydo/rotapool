@@ -1952,6 +1952,46 @@ class TestStateChangeHook:
 
         assert events == []
 
+    async def test_m9_hook_runs_outside_the_pool_lock(self) -> None:
+        """SPEC OBS-04: the hook must not hold the pool lock."""
+        seen_locked: list[bool] = []
+
+        def hook(resource_id: str, old: str, new: str, seq: int) -> None:
+            seen_locked.append(pool._lock.locked())  # noqa: SLF001
+
+        pool = Pool(
+            resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook
+        )
+
+        async def cooler(_: Resource[str]) -> str:
+            raise CooldownResource(reason="busy")
+
+        with pytest.raises(PoolExhausted):
+            await pool.run(cooler, max_attempts=1)
+        assert seen_locked == [False]
+
+    async def test_m10_hook_seq_is_monotonic(self) -> None:
+        seqs: list[int] = []
+
+        def hook(resource_id: str, old: str, new: str, seq: int) -> None:
+            seqs.append(seq)
+
+        pool = Pool(
+            resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook
+        )
+        await pool.disable("r0")
+        await pool.enable("r0")
+        assert seqs == [1, 2]
+
+    async def test_m11_three_arg_hook_is_deprecated(self) -> None:
+        events, hook = self._recorder()
+        with pytest.warns(DeprecationWarning, match="fourth seq"):
+            pool = Pool(
+                resources=_res(1), cooldown_table=FAST_TABLE, on_state_change=hook
+            )
+            await pool.disable("r0")
+        assert events == [("r0", "healthy", "disabled")]
+
     async def test_k5_snapshot_survives_concurrent_add(self) -> None:
         """snapshot() from another thread is safe while add() grows the pool.
 

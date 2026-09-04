@@ -138,7 +138,7 @@ It is called at the moment a resource's health status changes:
 - **Enable** -- `any -> healthy`, including cooldown recovery.
 - **Expiry** -- `cooling_down -> healthy`, fired lazily at selection time when an expired cooldown is observed.
 
-It is not called for `add()` / `remove()` (membership, not a status transition), cooldown-state resets on success, or no-op admin calls such as enabling a healthy resource. The hook runs synchronously while the pool lock is held: keep it fast, never block, and never call the pool's `async` methods from it (`snapshot()` and `stats()` are safe -- they are lock-free). An exception raised by the hook is logged to the `rotapool` logger and swallowed; monitoring must not break failover. Do not use it as a metrics bus -- incrementing counters from the hook is lossy (it does not fire on success, exhaustion, retries, or membership) and holds the pool lock.
+It is not called for `add()` / `remove()` (membership, not a status transition), cooldown-state resets on success, or no-op admin calls such as enabling a healthy resource. The hook runs after the pool lock is released. A 3-parameter callable still works (deprecated); a 4-parameter callable receives a monotonic `seq`. Keep it fast, never call the pool's `async` methods (`snapshot()` and `stats()` are safe). An exception raised by the hook is logged to the `rotapool` logger and swallowed. Do not use it as a metrics bus -- incrementing counters from the hook is lossy (it does not fire on success, exhaustion, retries, or membership).
 
 ## Cancellation Discrimination
 

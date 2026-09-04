@@ -8,6 +8,7 @@ import math
 import random
 import time
 import uuid
+import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import (
@@ -98,8 +99,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         max_attempts: int = 3,
         cooldown_table: tuple[float, ...] = _DEFAULT_COOLDOWN_TABLE,
         strategy: Strategy = "round_robin",
-        on_state_change: Callable[[str, ResourceStatus, ResourceStatus], None]
-        | None = None,
+        on_state_change: Callable[..., None] | None = None,
         cancel_siblings: bool = True,
     ) -> None:
         """Construct a pool over a set of interchangeable resources.
@@ -157,12 +157,13 @@ class Pool(AgentReadableMixin, Generic[T]):
               transition), cooldown-state resets on success, or no-op admin
               calls (``enable()`` on an already-healthy resource).
 
-            The hook is called synchronously while the pool lock is held: keep
-            it fast, never block, and never call the pool's ``async`` methods
-            from it (``snapshot()`` and ``stats()`` are safe -- they are
-            lock-free). An exception raised by the hook is logged to the
-            ``rotapool`` logger and swallowed; monitoring must not break
-            failover. Do not use it as a metrics bus.
+            The hook is invoked after the pool lock is released, as
+            ``on_state_change(resource_id, old_status, new_status)`` or
+            ``(..., seq)`` with a pool-level monotonic ``seq``. A 3-parameter
+            hook still works and emits ``DeprecationWarning``. Keep it fast and
+            never call the pool's ``async`` methods (``snapshot()`` and
+            ``stats()`` are safe). An exception is logged to the ``rotapool``
+            logger and swallowed. Do not use it as a metrics bus.
 
         cancel_siblings: when True (default), a cooldown or disable *signal*
             cancels strictly-younger in-flight usages on the same resource so
@@ -204,6 +205,11 @@ class Pool(AgentReadableMixin, Generic[T]):
                 f"{type(on_state_change).__name__}"
             )
         self._on_state_change = on_state_change
+        self._hook_nparams: int | None = None
+        self._event_seq: int = 0
+        self._pending_events: list[
+            tuple[str, ResourceStatus, ResourceStatus, int]
+        ] = []
 
         if type(cancel_siblings) is not bool:
             raise TypeError(
@@ -675,6 +681,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             self._set_resource_status_locked(resource, "healthy")
             self._admin_changed.notify_all()
             self._wait_pulse.set()
+        self._flush_state_change_events()
 
     async def disable(self, resource_id: str) -> None:
         """Administratively remove a resource from selection until ``enable()``.
@@ -693,6 +700,7 @@ class Pool(AgentReadableMixin, Generic[T]):
             self._set_resource_status_locked(resource, "disabled")
             self._admin_changed.notify_all()
             self._wait_pulse.set()
+        self._flush_state_change_events()
 
     async def remove(self, resource_id: str) -> None:
         """Drop a resource from the pool entirely -- the counterpart to ``add()``.
@@ -756,24 +764,51 @@ class Pool(AgentReadableMixin, Generic[T]):
             rc = self._resource_counters.get(resource.resource_id)
             if rc is not None:
                 rc.disables += 1
-        self._notify_state_change_locked(resource.resource_id, old_status, new_status)
+        self._queue_state_change_locked(resource.resource_id, old_status, new_status)
 
-    def _notify_state_change_locked(
+    def _queue_state_change_locked(
         self, resource_id: str, old_status: ResourceStatus, new_status: ResourceStatus
     ) -> None:
-        """Invoke the ``on_state_change`` hook; MUST hold the pool lock.
+        """Queue a hook event. MUST hold the pool lock; flush after release."""
+        self._event_seq += 1
+        self._pending_events.append(
+            (resource_id, old_status, new_status, self._event_seq)
+        )
 
-        Escalation events (a cooldown landing while already cooling_down) are
-        delivered with old == new == "cooling_down" -- callers that only care
-        about flips can simply compare the two statuses.
-        """
-        if self._on_state_change is None:
+    def _flush_state_change_events(self) -> None:
+        """Dispatch queued events after the pool lock is released."""
+        events = self._pending_events
+        self._pending_events = []
+        if not events or self._on_state_change is None:
             return
-        try:
-            self._on_state_change(resource_id, old_status, new_status)
-        except Exception:
-            # Monitoring must never break failover: log and move on.
-            logger.exception("on_state_change callback failed for %s", resource_id)
+        if self._hook_nparams is None:
+            try:
+                self._hook_nparams = len(
+                    inspect.signature(self._on_state_change).parameters
+                )
+            except (TypeError, ValueError):
+                self._hook_nparams = 3
+        nparams = self._hook_nparams
+        if nparams < 4 and not getattr(self, "_hook_sig_warned", False):
+            self._hook_sig_warned = True
+            warnings.warn(
+                "on_state_change(resource_id, old, new) is deprecated; "
+                "accept a fourth seq argument",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        for resource_id, old_status, new_status, seq in events:
+            try:
+                if nparams >= 4:
+                    self._on_state_change(
+                        resource_id, old_status, new_status, seq
+                    )
+                else:
+                    self._on_state_change(resource_id, old_status, new_status)
+            except Exception:
+                logger.exception(
+                    "on_state_change callback failed for %s", resource_id
+                )
 
     @staticmethod
     def _build_resources(
@@ -804,6 +839,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         consistent.
         """
         now = self._timestamp()
+        acquired: tuple[Resource[T], Usage] | None = None
 
         async with self._lock:
             candidates: list[Resource[T]] = []
@@ -824,39 +860,39 @@ class Pool(AgentReadableMixin, Generic[T]):
 
                 candidates.append(r)
 
-            if not candidates:
-                return None
-
-            if self._strategy == "primary_backup":
-                # Candidates were appended in original resource-dict insertion order,
-                # so the first one is the highest-priority eligible resource.
-                selected = candidates[0]
-            else:
-                selected = min(
-                    candidates,
-                    key=lambda r: (
-                        len(self._inflight_by_resource.get(r.resource_id, set())),
-                        r.last_acquired_at,
-                    ),
+            if candidates:
+                if self._strategy == "primary_backup":
+                    # Candidates were appended in original resource-dict insertion order,
+                    # so the first one is the highest-priority eligible resource.
+                    selected = candidates[0]
+                else:
+                    selected = min(
+                        candidates,
+                        key=lambda r: (
+                            len(self._inflight_by_resource.get(r.resource_id, set())),
+                            r.last_acquired_at,
+                        ),
+                    )
+                selected.last_acquired_at = now
+                self._next_acquisition_order += 1
+                self._pool_counters.attempts += 1
+                rc = self._resource_counters.get(selected.resource_id)
+                if rc is not None:
+                    rc.acquires += 1
+                usage = Usage(
+                    usage_id=str(uuid.uuid4()),
+                    request_id=request_id,
+                    resource_id=selected.resource_id,
+                    acquired_at=now,
+                    acquisition_order=self._next_acquisition_order,
                 )
-            selected.last_acquired_at = now
-            self._next_acquisition_order += 1
-            self._pool_counters.attempts += 1
-            rc = self._resource_counters.get(selected.resource_id)
-            if rc is not None:
-                rc.acquires += 1
-            usage = Usage(
-                usage_id=str(uuid.uuid4()),
-                request_id=request_id,
-                resource_id=selected.resource_id,
-                acquired_at=now,
-                acquisition_order=self._next_acquisition_order,
-            )
-            self._usages[usage.usage_id] = usage
-            self._inflight_by_resource.setdefault(selected.resource_id, set()).add(
-                usage.usage_id
-            )
-            return selected, usage
+                self._usages[usage.usage_id] = usage
+                self._inflight_by_resource.setdefault(selected.resource_id, set()).add(
+                    usage.usage_id
+                )
+                acquired = selected, usage
+        self._flush_state_change_events()
+        return acquired
 
     async def _acquire_after_cooldown(
         self, request_id: str, retry_delay: float, deadline: float | None
@@ -950,41 +986,42 @@ class Pool(AgentReadableMixin, Generic[T]):
             usage.status = "done"
             resource = self._resources.get(usage.resource_id)
             if resource is None or resource.status == "disabled":
-                return
-
-            old_status = resource.status
-            resource.consecutive_cooldown += 1
-
-            if cooldown_seconds is not None:
-                cd = cooldown_seconds
+                pass
             else:
-                idx = max(resource.consecutive_cooldown - 1, 0)
-                idx = min(idx, len(self._cooldown_table) - 1)
-                cd = self._cooldown_table[idx]
+                old_status = resource.status
+                resource.consecutive_cooldown += 1
 
-            resource.status = "cooling_down"
-            resource.cooldown_until = max(resource.cooldown_until, now + cd)
+                if cooldown_seconds is not None:
+                    cd = cooldown_seconds
+                else:
+                    idx = max(resource.consecutive_cooldown - 1, 0)
+                    idx = min(idx, len(self._cooldown_table) - 1)
+                    cd = self._cooldown_table[idx]
 
-            # Delivered even when old_status is already "cooling_down": an
-            # escalation or extension changes magnitude, not status, and the
-            # hook is the only push-notification channel for it.
-            self._notify_state_change_locked(
-                resource.resource_id, old_status, "cooling_down"
-            )
+                resource.status = "cooling_down"
+                resource.cooldown_until = max(resource.cooldown_until, now + cd)
 
-            self._pool_counters.cooldowns += 1
-            rc = self._resource_counters.get(resource.resource_id)
-            if rc is not None:
-                rc.cooldowns += 1
+                # Delivered even when old_status is already "cooling_down": an
+                # escalation or extension changes magnitude, not status, and the
+                # hook is the only push-notification channel for it.
+                self._queue_state_change_locked(
+                    resource.resource_id, old_status, "cooling_down"
+                )
 
-            if self._cancel_siblings:
-                to_cancel = self._collect_younger_usages_locked(usage)
-                n_cancel = len(to_cancel)
-                if n_cancel:
-                    self._pool_counters.sibling_cancels += n_cancel
-                    if rc is not None:
-                        rc.sibling_cancels += n_cancel
+                self._pool_counters.cooldowns += 1
+                rc = self._resource_counters.get(resource.resource_id)
+                if rc is not None:
+                    rc.cooldowns += 1
 
+                if self._cancel_siblings:
+                    to_cancel = self._collect_younger_usages_locked(usage)
+                    n_cancel = len(to_cancel)
+                    if n_cancel:
+                        self._pool_counters.sibling_cancels += n_cancel
+                        if rc is not None:
+                            rc.sibling_cancels += n_cancel
+
+        self._flush_state_change_events()
         self._cancel_tasks(to_cancel)
 
     async def _on_disable(self, usage: Usage) -> None:
@@ -1011,6 +1048,7 @@ class Pool(AgentReadableMixin, Generic[T]):
                 if rc is not None:
                     rc.sibling_cancels += n_cancel
 
+        self._flush_state_change_events()
         self._cancel_tasks(to_cancel)
 
     async def _cleanup_usage(self, usage: Usage) -> None:
@@ -1264,8 +1302,8 @@ N ``run()`` invocations.
   ``remove()`` and breaks ``rate()``.
 - Register two ``PoolCollector`` instances on one registry, or import
   ``PoolCollector`` from ``rotapool`` (it lives in ``rotapool.prometheus``).
-- Increment counters from ``on_state_change`` -- it runs under the lock and
-  misses success, exhaustion, retries, and membership.
+- Increment counters from ``on_state_change`` -- it misses success,
+  exhaustion, retries, and membership.
 
 ### Gotcha
 

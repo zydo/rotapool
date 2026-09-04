@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches 0.4.0. Non-idempotent operations should pass False (at-least-once
   sibling cancellation).
 
+### Changed
+
+- `on_state_change` is invoked after the pool lock is released. A fourth
+  monotonic `seq` argument is accepted; 3-parameter hooks still work with a
+  `DeprecationWarning`.
+
 ## [0.4.0] - 2026-09-02
 
 ### Added

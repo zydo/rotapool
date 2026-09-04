@@ -39,9 +39,8 @@ pool = Pool(
     #                  (any -> disabled), admin enable() (any -> healthy), and lazy
     #                  cooldown expiry at selection time (cooling_down -> healthy).
     #                  NOT fired for add()/remove() (membership, not status), success
-    #                  resets, or no-op admin calls. Called synchronously under the
-    #                  pool lock: keep it fast, never block, never call the pool's
-    #                  async methods (snapshot() and stats() are safe -- lock-free).
+    #                  resets, or no-op admin calls. Called after the pool lock is
+    #                  released. 3-arg hooks are deprecated; 4-arg hooks receive seq.
     #                  Exceptions are logged to the "rotapool" logger and swallowed.
     #                  Do not use it as a metrics bus.
 
