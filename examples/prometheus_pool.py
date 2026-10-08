@@ -4,14 +4,11 @@ Requires the optional extra (not a core dependency):
 
     pip install "rotapool[prometheus]"
     python examples/prometheus_pool.py
+    curl -s http://127.0.0.1:8000/metrics | grep rotapool_
 
-Print one scrape to stdout instead of serving:
+Print one scrape to stdout instead of serving (no HTTP port):
 
     python examples/prometheus_pool.py --once
-
-Then:
-
-    curl -s http://127.0.0.1:8000/metrics | grep rotapool_
 """
 
 from __future__ import annotations

@@ -40,7 +40,7 @@ pool = Pool(
         Resource(resource_id="key-2", value="sk-bbb"),
         Resource(resource_id="key-3", value="sk-ccc"),
     ],
-    max_attempts=3,                              # Total retry budget per run() call (capped at len(resources))
+    max_attempts=3,                              # Retry budget per run(). Fail-fast caps it at len(resources); wait_for_cooldown=True uses this number only.
     cooldown_table=(30.0, 120.0, 300.0, 600.0),  # Escalation: 1st=30s, 2nd=120s, 3rd=300s, 4th+=600s
     # strategy="round_robin",                    # default: fewest in-flight first, then oldest last_acquired_at
 )
@@ -49,6 +49,10 @@ pool = Pool(
 ## Option 1: Use the Decorator
 
 ```python
+# Create the HTTP client outside the operation; run() invokes the body once
+# per attempt, so constructing the client inside would redo TLS every retry.
+client = httpx.AsyncClient()
+
 # Resource selection happens automatically per the pool's strategy
 # (`round_robin` by default: fewest in-flight first, then oldest last_acquired_at).
 # All parameters are optional and forward to pool.run() on every call.
@@ -58,10 +62,6 @@ pool = Pool(
     retry_delay=0.5,           # Base pause between failed attempts (jittered +/-50%)
     wait_for_cooldown=False,   # Wait out the earliest cooldown instead of failing fast
 )
-client = httpx.AsyncClient()  # outside the operation; captured by the body
-
-# Create the HTTP client outside the operation; run() invokes the body once
-# per attempt, so constructing the client inside would redo TLS every retry.
 async def call_upstream(resource, url, payload):
     resp = await client.post(
         url,

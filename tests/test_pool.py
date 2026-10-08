@@ -545,6 +545,37 @@ class TestCooldown:
         assert result == "v0"
         assert pool.snapshot()["r0"]["status"] == "healthy"
 
+    async def test_c6_short_explicit_cooldown_does_not_shorten(self) -> None:
+        """An explicit cooldown is a floor. A short Retry-After from an older
+        in-flight usage must not pull an already-longer cooldown forward."""
+        clock = _VirtualClock()
+        pool = Pool(resources=_res(1), cooldown_table=(30.0,), max_attempts=1)
+        pool._now = clock.now  # noqa: SLF001
+        pool._sleep = clock.sleep  # noqa: SLF001
+        older_hold = asyncio.Event()
+
+        async def older(_: Resource[str]) -> str:
+            await older_hold.wait()
+            raise CooldownResource(cooldown_seconds=1.0)
+
+        async def younger(_: Resource[str]) -> str:
+            raise CooldownResource(cooldown_seconds=30.0)
+
+        older_t = asyncio.create_task(pool.run(older))
+        await asyncio.sleep(0)
+        with pytest.raises(PoolExhausted):
+            await pool.run(younger)
+        assert pool.snapshot()["r0"]["cooldown_seconds_remaining"] == pytest.approx(
+            30.0
+        )
+
+        older_hold.set()
+        with pytest.raises(PoolExhausted):
+            await older_t
+        assert pool.snapshot()["r0"]["cooldown_seconds_remaining"] == pytest.approx(
+            30.0
+        )
+
 
 # ===================================================================
 # Group D — Disable semantics
@@ -1778,8 +1809,8 @@ class TestWaitForCooldown:
 
     async def test_i12_cancelling_a_waiter_mid_sleep_cleans_up_timers(self) -> None:
         """Cancelling run() while it is parked in the cooldown wait propagates
-        CancelledError; the finally-branch cancels the still-pending
-        sleep/pulse tasks that asyncio.wait leaves behind."""
+        CancelledError; the race's finally-branch cancels the still-pending
+        sleep and pulse tasks."""
         pool = Pool(resources=_res(1), cooldown_table=(30.0,))
 
         async def cooler(_: Resource[str]) -> str:
@@ -1803,6 +1834,55 @@ class TestWaitForCooldown:
             await waiter
         for _ in range(5):
             await asyncio.sleep(0)
+
+    async def test_i13_signal_disable_wakes_waiter(self) -> None:
+        """A DisableResource signal invalidates a cooldown wait the same way
+        admin disable() does: the resource is no longer cooling, so sleeping
+        out its old expiry cannot help."""
+        clock = _VirtualClock()
+        pool = Pool(resources=_res(1), cooldown_table=(30.0,), max_attempts=1)
+        pool._now = clock.now  # noqa: SLF001
+        pool._sleep = clock.sleep  # noqa: SLF001
+        older_hold = asyncio.Event()
+
+        async def older(_: Resource[str]) -> str:
+            await older_hold.wait()
+            raise DisableResource(reason="revoked")
+
+        async def cool(_: Resource[str]) -> str:
+            raise CooldownResource(cooldown_seconds=30.0)
+
+        async def ident(r: Resource[str]) -> str:
+            return r.value
+
+        older_t = asyncio.create_task(pool.run(older))
+        await asyncio.sleep(0)
+        with pytest.raises(PoolExhausted):
+            await pool.run(cool)
+        waiter = asyncio.create_task(
+            pool.run(ident, wait_for_cooldown=True, retry_delay=0)
+        )
+        for _ in range(100):
+            if clock.n_sleepers:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("waiter never slept toward the cooldown expiry")
+
+        older_hold.set()
+        with pytest.raises(PoolExhausted):
+            await older_t
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if waiter.done():
+                break
+        else:
+            pytest.fail(
+                "DisableResource did not wake the cooldown waiter; "
+                f"sleepers={clock._sleepers}"  # noqa: SLF001
+            )
+        with pytest.raises(PoolExhausted, match="no eligible resource"):
+            await waiter
 
 
 # ===================================================================

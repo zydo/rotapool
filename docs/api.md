@@ -102,7 +102,8 @@ await pool.run(
     #                  after the deadline. The wake-up is jittered by an extra
     #                  retry_delay * uniform(0, 1), capped by the deadline, to avoid
     #                  waiter stampedes at the expiry instant. False = fail fast (default).
-    #                  Admin add() / enable() / disable() / remove() wake waiters so
+    #                  Admin add() / enable() / disable() / remove(), and a
+    #                  CooldownResource or DisableResource signal, wake waiters so
     #                  they re-evaluate immediately.
 
     request_id: str | None = None,
@@ -267,6 +268,8 @@ raise CooldownResource(
     # Explicit cooldown duration (e.g. from Retry-After header). Must be >= 0
     # (negative and NaN raise ValueError at construction).
     # None = use the pool's cooldown_table based on consecutive_cooldown count.
+    # Applied as a floor: expiry becomes max(current, now + seconds), so a
+    # short Retry-After never shortens a longer cooldown already running.
 
     reason: str | None = None,
     # Free-form string surfaced in the exception message and logs.

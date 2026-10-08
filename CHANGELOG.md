@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `DisableResource` signal wakes `run(wait_for_cooldown=True)` sleepers,
+  as admin `disable()` already did. They were sleeping out a cooldown the
+  signal had already made irrelevant.
+
 ## [0.5.0] - 2026-09-04
 
 ### Added

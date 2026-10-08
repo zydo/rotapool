@@ -132,7 +132,10 @@ class Pool(AgentReadableMixin, Generic[T]):
             resource escalates one slot; the counter resets on the next success.
             Counts past the table length clamp to the last entry. Per-event
             ``CooldownResource(cooldown_seconds=...)`` (e.g. from ``Retry-After``)
-            overrides this for that one event without resetting the counter. Entries
+            supplies that event's duration instead of the table, without resetting
+            the counter. It is a floor: the expiry becomes
+            ``max(cooldown_until, now + seconds)``, so a short value never
+            shortens a longer cooldown already running. Entries
             must be finite and >= 0.
 
         strategy: how the pool picks among resources that are eligible (not disabled,
@@ -248,12 +251,6 @@ class Pool(AgentReadableMixin, Generic[T]):
         # Guards all possibly racing states.
         self._lock: asyncio.Lock = asyncio.Lock()
 
-        # Wakes wait_for_cooldown sleepers when admin enable()/disable() changes
-        # eligibility, so they re-evaluate instead of sleeping out a stale plan.
-        # Shares self._lock, so holding the lock and holding the condition are
-        # the same thing.
-        self._admin_changed: asyncio.Condition = asyncio.Condition(lock=self._lock)
-
         # usage_id -> Usage
         self._usages: dict[str, Usage] = {}
 
@@ -265,6 +262,9 @@ class Pool(AgentReadableMixin, Generic[T]):
         # need a deterministic "younger than" relation.
         self._next_acquisition_order: int = 0
 
+        # Wakes wait_for_cooldown sleepers when eligibility or a cooldown expiry
+        # may have changed: admin add/enable/disable/remove, and a cooldown or
+        # disable signal. Cleared by a waiter immediately before it sleeps.
         self._wait_pulse: asyncio.Event = asyncio.Event()
 
         # Test-only knobs: the conformance virtual clock sets these to its
@@ -342,8 +342,11 @@ class Pool(AgentReadableMixin, Generic[T]):
             that provably cannot help. The wake-up is jittered by an extra
             ``retry_delay * uniform(0, 1)`` (capped by ``deadline``) so concurrent
             waiters do not stampede the recovered resource at the exact expiry
-            instant. Admin ``enable()`` / ``disable()`` interrupt the wait so the
-            sleeper re-evaluates immediately. Defaults to False (fail fast).
+            instant. The wait is interrupted by admin ``add()`` / ``enable()`` /
+            ``disable()`` / ``remove()`` and by a ``CooldownResource`` or
+            ``DisableResource`` signal, so the sleeper re-evaluates immediately
+            instead of sleeping out a plan that those events just invalidated.
+            Defaults to False (fail fast).
 
         request_id: opaque string attached to every `Usage` created by this call.
             Useful for correlating logs, metrics, or tracing back to the original
@@ -718,7 +721,7 @@ class Pool(AgentReadableMixin, Generic[T]):
                 value=value,
                 max_in_flight=max_in_flight,
             )
-        async with self._admin_changed:
+        async with self._lock:
             if resource.resource_id in self._resources:
                 raise ValueError(
                     f"Duplicate resource_id in pool: {resource.resource_id!r}"
@@ -727,7 +730,6 @@ class Pool(AgentReadableMixin, Generic[T]):
             # never observes a missing counter dict entry.
             self._resource_counters[resource.resource_id] = _ResourceCounters()
             self._resources[resource.resource_id] = resource
-            self._admin_changed.notify_all()
             self._wait_pulse.set()
         return resource
 
@@ -743,7 +745,7 @@ class Pool(AgentReadableMixin, Generic[T]):
 
         Raises KeyError for an unknown resource_id.
         """
-        async with self._admin_changed:
+        async with self._lock:
             resource = self._get_resource(resource_id)
             # Clear cooldown state before the flip so the on_state_change
             # callback (if any) observes the fully-recovered resource.
@@ -751,7 +753,6 @@ class Pool(AgentReadableMixin, Generic[T]):
             resource.consecutive_cooldown = 0
             self._probing.discard(resource.resource_id)
             self._set_resource_status_locked(resource, "healthy")
-            self._admin_changed.notify_all()
             self._wait_pulse.set()
         self._flush_state_change_events()
 
@@ -767,10 +768,9 @@ class Pool(AgentReadableMixin, Generic[T]):
 
         Raises KeyError for an unknown resource_id.
         """
-        async with self._admin_changed:
+        async with self._lock:
             resource = self._get_resource(resource_id)
             self._set_resource_status_locked(resource, "disabled")
-            self._admin_changed.notify_all()
             self._wait_pulse.set()
         self._flush_state_change_events()
 
@@ -802,7 +802,7 @@ class Pool(AgentReadableMixin, Generic[T]):
         its ``max_in_flight``) until they finish, so capacity is enforced
         conservatively during the overlap.
         """
-        async with self._admin_changed:
+        async with self._lock:
             self._get_resource(resource_id)
             # Drop the resource first so stats() membership is the source of
             # truth; a racy stats() may briefly see zeros for a still-listed
@@ -810,7 +810,6 @@ class Pool(AgentReadableMixin, Generic[T]):
             del self._resources[resource_id]
             self._resource_counters.pop(resource_id, None)
             self._probing.discard(resource_id)
-            self._admin_changed.notify_all()
             self._wait_pulse.set()
 
     def _get_resource(self, resource_id: str) -> Resource[T]:
@@ -988,14 +987,16 @@ class Pool(AgentReadableMixin, Generic[T]):
         and loop), reuses ``retry_delay`` as the pause-granularity knob (0 disables
         it, like every other pause), and is capped by ``deadline``.
 
-        The sleep is interruptible: admin ``enable()`` / ``disable()`` notify
-        ``self._admin_changed``, so the waiter re-evaluates immediately instead of
-        sleeping out a plan those calls just invalidated. A spurious wake-up (the
-        admin change did not affect this waiter) is harmless -- the loop recomputes.
+        The sleep is interruptible via ``self._wait_pulse``. Admin
+        ``add()`` / ``enable()`` / ``disable()`` / ``remove()`` and a
+        ``CooldownResource`` or ``DisableResource`` signal set that event, so
+        the waiter re-evaluates immediately instead of sleeping out a plan
+        those calls just invalidated. A spurious wake-up (the change did not
+        affect this waiter) is harmless -- the loop recomputes.
         """
         acquired: tuple[Resource[T], Usage] | None = None
         while acquired is None:
-            async with self._admin_changed:
+            async with self._lock:
                 wakes = [
                     r.cooldown_until
                     for r in self._resources.values()
@@ -1094,7 +1095,6 @@ class Pool(AgentReadableMixin, Generic[T]):
                         self._pool_counters.sibling_cancels += n_cancel
                         if rc is not None:
                             rc.sibling_cancels += n_cancel
-                self._admin_changed.notify_all()
                 self._wait_pulse.set()
 
         self._flush_state_change_events()
@@ -1106,6 +1106,10 @@ class Pool(AgentReadableMixin, Generic[T]):
 
         The triggering usage itself is excluded from cancellation -- its own cleanup is
         handled by `run()`'s finally block.
+
+        Wakes ``wait_for_cooldown`` sleepers. A disable often lands on a resource
+        that is already cooling; the old expiry is then a wait that cannot help,
+        same as admin ``disable()``.
         """
         to_cancel: list[Usage] = []
 
@@ -1123,6 +1127,7 @@ class Pool(AgentReadableMixin, Generic[T]):
                 rc = self._resource_counters.get(usage.resource_id)
                 if rc is not None:
                     rc.sibling_cancels += n_cancel
+            self._wait_pulse.set()
 
         self._flush_state_change_events()
         self._cancel_tasks(to_cancel)
@@ -1275,11 +1280,13 @@ even if a ``deadline`` would outlive the cooldowns. Pass ``wait_for_cooldown=Tru
 and select again -- useful for batch jobs that prefer waiting over failing. It
 never waits on disabled or saturated resources (no known wake-up time), and with
 a ``deadline`` it raises immediately when the earliest expiry lands at or after
-it, rather than sleeping out a wait that cannot help. Admin ``enable()`` /
-``disable()`` interrupt the wait so the sleeper re-evaluates immediately. Admin
-``add()`` also wakes waiters because newly added healthy capacity may satisfy
-them immediately, and ``remove()`` wakes them because a cooldown they were
-waiting on may have belonged to the removed resource.
+it, rather than sleeping out a wait that cannot help. Admin ``add()`` /
+``enable()`` / ``disable()`` / ``remove()`` and a ``CooldownResource`` or
+``DisableResource`` signal interrupt the wait so the sleeper re-evaluates
+immediately: ``enable()`` and ``add()`` may have made a resource selectable,
+and ``disable()``, ``remove()``, or a disable signal may have turned the
+cooldown being slept out into a wait that cannot help. A cooldown signal
+wakes waiters so they recompute an extended expiry.
 
 ### Dynamic add
 

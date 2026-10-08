@@ -65,8 +65,8 @@ class Usage:
     - `asyncio.Task` when the operation returned a coroutine (framework wrapped it).
     - `asyncio.Future` when the operation directly returned a Future.
     - `None` when the operation returned a plain Awaitable with no `.cancel()`
-      method. In that case `cancel_younger_usages` silently no-ops on this usage
-      and it runs to natural completion -- cancellation is best-effort by design.
+      method. Younger-sibling cancellation then skips this usage and it runs
+      to natural completion -- cancellation is best-effort by design.
     """
 
     usage_id: str

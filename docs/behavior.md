@@ -85,7 +85,7 @@ With a `deadline`, the wait only happens when the earliest cooldown ends before 
 
 The wake-up is jittered too: each waiter sleeps an extra `retry_delay * uniform(0, 1)` past the expiry, capped by `deadline`, so concurrent waiters do not all fire at the recovered resource in the same instant. As with the retry pause, `retry_delay=0` disables the jitter.
 
-Waiters also react to admin calls: `pool.add()` wakes them so they can acquire newly added capacity immediately, `pool.enable()` wakes them so they can acquire the now-eligible resource immediately, `pool.disable()` and `pool.remove()` wake them so they can re-evaluate and fail fast instead of sleeping out a cooldown that no longer matters.
+Waiters also wake when the plan they are sleeping on changes. `pool.add()` and `pool.enable()` wake them so they can acquire the new capacity immediately. `pool.disable()`, `pool.remove()`, and a `DisableResource` signal wake them so they fail fast instead of sleeping out a cooldown that no longer matters. A `CooldownResource` signal wakes them so they recompute an extended expiry.
 
 ## Admin Control
 
