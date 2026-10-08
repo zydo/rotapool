@@ -2346,7 +2346,9 @@ class TestStateChangeHook:
         )
 
         async def cooler(r: Resource[str]) -> str:
-            raise CooldownResource(reason="busy")
+            # Long enough that snapshot()'s lazy expiry cannot flip the
+            # resource back to healthy before the assertion on a slow runner.
+            raise CooldownResource(cooldown_seconds=60.0, reason="busy")
 
         with caplog.at_level(logging.ERROR, logger="rotapool.pool"):
             with pytest.raises(PoolExhausted):

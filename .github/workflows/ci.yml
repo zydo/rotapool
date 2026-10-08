@@ -15,11 +15,13 @@ on:
   pull_request:
   workflow_call:
 
-# One CI run per commit. A main push and a tag's workflow_call of this file
-# would otherwise overlap and fight over the uv cache.
+# One CI run per commit at a time. Pushing a release commit and its tag both
+# start this workflow (the branch push, and publish.yml's workflow_call).
+# Cancelling the one already running leaves a red check on the release.
+# Queue instead, so they never overlap on the setup-uv cache and both finish.
 concurrency:
   group: ci-${{ github.sha }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   lint:

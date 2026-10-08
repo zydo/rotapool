@@ -64,6 +64,10 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A moved tag for a version already on PyPI should not fail the
+          # release. The tag/version check above still rejects a mismatch.
+          skip-existing: true
 
   github-release:
     needs: publish-pypi

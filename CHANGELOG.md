@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-08
+
 ### Fixed
 
 - A `DisableResource` signal wakes `run(wait_for_cooldown=True)` sleepers,
@@ -132,6 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release.
 
+[0.5.1]: https://github.com/zydo/rotapool/releases/tag/v0.5.1
 [0.5.0]: https://github.com/zydo/rotapool/releases/tag/v0.5.0
 [0.4.0]: https://github.com/zydo/rotapool/releases/tag/v0.4.0
 [0.3.0]: https://github.com/zydo/rotapool/releases/tag/v0.3.0
