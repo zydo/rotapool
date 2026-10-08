@@ -1,7 +1,8 @@
 # rotapool
 
-[![CI](https://github.com/zydo/rotapool/actions/workflows/ci.yml/badge.svg)](https://github.com/zydo/rotapool/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/rotapool.svg)](https://pypi.org/project/rotapool/)
+<a href="https://github.com/zydo/rotapool/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/zydo/rotapool/ci.yml?branch=main&amp;label=CI&amp;logo=githubactions&amp;logoColor=white&amp;style=for-the-badge&amp;labelColor=1f2328"></a>
+<a href="https://pypi.org/project/rotapool/"><img alt="PyPI" src="https://img.shields.io/pypi/v/rotapool?label=PyPI&amp;logo=pypi&amp;logoColor=white&amp;color=2563eb&amp;style=for-the-badge&amp;labelColor=1f2328"></a>
+<a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/zydo/rotapool?color=6e7781&amp;style=for-the-badge&amp;labelColor=1f2328"></a>
 
 Generic async resource pool with health-aware selection, cooldown, and retry
 
