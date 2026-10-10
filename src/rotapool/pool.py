@@ -469,23 +469,14 @@ class Pool(AgentReadableMixin, Generic[T]):
                 continue
 
             except asyncio.CancelledError:
-                # Distinguish "outer caller cancelled us" (re-raise so shutdown is
-                # honored) from "we cancelled our own handle via _on_cooldown /
-                # _on_disable" (swallow and retry). _collect_younger_usages_locked sets
-                # usage.status = "cancelled" under the lock *before* invoking .cancel()
-                # on the handle, so seeing "cancelled" here means a sibling on the same
-                # resource cancelled us. With no cancel handle (usage.task is None) the
-                # pool could not have delivered this error even if a sibling marked the
-                # usage cancelled, so it must be external. Works on any Python 3.10+
-                # (no asyncio.Task.cancelling() dependency); the trade-off is that an
-                # external cancel landing in the same tick as an internal one is
-                # classified internal and absorbed for that attempt -- 3.11+
-                # Task.cancelling() could disambiguate. Cleanup runs in finally.
-                cancelled_internally = (
-                    usage.status == "cancelled" and usage.task is not None
-                )
+                # Sibling cancellation targets the operation handle, not the task
+                # running run(). Any pending cancellation on the caller task is
+                # external, even if a sibling cancelled the handle in the same turn.
+                # A CancelledError raised by the operation itself still propagates.
+                caller = cast(asyncio.Task[Any], asyncio.current_task())
+                cancelled_internally = usage.status == "cancelled"
                 usage.status = "cancelled"
-                if not cancelled_internally:
+                if caller.cancelling() or not cancelled_internally:
                     raise
                 # SPEC CANCEL-03: exhausted last-error is the health signal
                 # that cancelled us, not a raw CancelledError.
@@ -1400,7 +1391,6 @@ retries them elsewhere unless ``cancel_siblings=False``; OLDER usages run to
 completion (they may already have side effects upstream). The default is
 at-least-once: cancelled work may already have reached the backend. ``asyncio.CancelledError`` from sibling
 cancellation is swallowed and retried; only OUTER caller cancellation
-propagates. Rare edge: an outer cancel landing in the same event-loop
-tick as an internal sibling cancel is classified internal and absorbed
-for that attempt (3.10-compat trade-off) -- cancel again to stop.
+propagates, including when it lands in the same event-loop turn as a
+sibling cancellation.
 """

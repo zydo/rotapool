@@ -793,6 +793,58 @@ class TestCancellation:
 
         assert pool.snapshot()["r0"]["in_flight"] == 0
 
+    @pytest.mark.parametrize("outer_cancel", [False, True])
+    @pytest.mark.parametrize("signal", [CooldownResource, DisableResource])
+    async def test_same_turn_sibling_and_outer_cancel(
+        self, ops: Ops, outer_cancel: bool, signal: type[Exception]
+    ) -> None:
+        """A synchronous health hook cancels the caller before it can resume."""
+        started = asyncio.Event()
+        fail = asyncio.Event()
+        attempts: list[str] = []
+
+        def on_change(rid: str, old: str, new: str, seq: int) -> None:
+            if outer_cancel:
+                waiter.cancel()
+
+        pool = Pool(
+            resources=_res(2), strategy="primary_backup", on_state_change=on_change
+        )
+
+        async def trigger(_: Resource[str]) -> str:
+            await fail.wait()
+            raise signal()
+
+        async def operation(r: Resource[str]) -> str:
+            attempts.append(r.resource_id)
+            if r.resource_id == "r0":
+                started.set()
+                await asyncio.Event().wait()
+            return r.value
+
+        trigger_task = asyncio.create_task(pool.run(trigger, max_attempts=1))
+        # Ensure the trigger is older than the usage it will cancel.
+        await asyncio.sleep(0)
+        waiter = asyncio.create_task(pool.run(ops.op(operation), retry_delay=0))
+        await started.wait()
+        fail.set()
+        with pytest.raises(PoolExhausted):
+            await trigger_task
+        if outer_cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert attempts == ["r0"]
+            assert pool.stats().runs_cancelled == 1
+        elif ops.shape == "awaitable":
+            # Plain awaitables have no sibling cancellation handle.
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        else:
+            assert await waiter == "v1"
+            assert attempts == ["r0", "r1"]
+        assert all(r["in_flight"] == 0 for r in pool.snapshot().values())
+
     async def test_e5_internal_cancel_swallowed_retried(self, ops: Ops) -> None:
         """Internal CancelledError is swallowed and retried; caller never sees it.
 

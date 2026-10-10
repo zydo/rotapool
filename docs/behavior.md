@@ -144,4 +144,4 @@ It is not called for `add()` / `remove()` (membership, not a status transition),
 
 ## Cancellation Discrimination
 
-The framework distinguishes external cancellation, such as client disconnect or shutdown, from internal cancellation, such as resource failure, by checking `usage.status`. The cooldown/disable handler sets the status to `"cancelled"` under the pool lock before invoking `.cancel()` on the handle, so observing that status when `CancelledError` arrives means "we cancelled ourselves" -- except for the one-tick edge case described in the [cancellation gotcha](pitfalls-and-testing.md#gotcha-cancellation-only-hits-younger-siblings). Works on any Python 3.10+.
+The framework checks the caller task's `Task.cancelling()` count to detect external cancellation, such as client disconnect or shutdown. Sibling cancellation targets the operation handle, leaving the caller task's count unchanged. External cancellation propagates even when a sibling cancels the operation in the same event-loop turn. The usage status identifies sibling cancellation for retry; a `CancelledError` raised by the operation itself propagates. Requires Python 3.11+.

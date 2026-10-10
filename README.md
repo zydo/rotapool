@@ -46,7 +46,7 @@ pip install rotapool
 uv add rotapool
 ```
 
-Requires Python 3.10+. Zero runtime dependencies. Optional extras: `pip install "rotapool[agent]"` for [agent-readable](https://github.com/zydo/agent-readable), `pip install "rotapool[prometheus]"` for a Prometheus collector over `pool.stats()`. A runnable scrape is in [`examples/prometheus_pool.py`](examples/prometheus_pool.py).
+Requires Python 3.11+; tested on Python 3.11–3.15. Free-threaded interpreters are unsupported. Zero runtime dependencies. Optional extras: `pip install "rotapool[agent]"` for [agent-readable](https://github.com/zydo/agent-readable), `pip install "rotapool[prometheus]"` for a Prometheus collector over `pool.stats()`. A runnable scrape is in [`examples/prometheus_pool.py`](examples/prometheus_pool.py).
 
 ## Quick Start
 

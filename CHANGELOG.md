@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-09
+
+### Changed
+
+- Require Python 3.11+ and test Python 3.11–3.15. Python 3.10 users can
+  continue using 0.5.1. Free-threaded interpreters remain unsupported.
+
+### Fixed
+
+- External cancellation propagates when it arrives in the same event-loop
+  turn as sibling cancellation. Use the caller task's `Task.cancelling()`
+  count, available since Python 3.11; sibling cancellation alone still retries.
+
 ## [0.5.1] - 2026-10-08
 
 ### Fixed
@@ -134,6 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release.
 
+[0.6.0]: https://github.com/zydo/rotapool/releases/tag/v0.6.0
 [0.5.1]: https://github.com/zydo/rotapool/releases/tag/v0.5.1
 [0.5.0]: https://github.com/zydo/rotapool/releases/tag/v0.5.0
 [0.4.0]: https://github.com/zydo/rotapool/releases/tag/v0.4.0
